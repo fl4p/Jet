@@ -820,6 +820,56 @@ namespace Renderer
 
         const bool plainOpaqueReplace = (alpha == 255 && !isWaterReflect && !isAdditive);
 
+#if JET_FLAT_KERNEL && LIGHTING && !Z_BUFFERING && !HALF_WIDTH_BUFFERS && !FIELD_BUFFERS && \
+    !DEBUG_OVERDRAW && !POSTFX_CELLSHADING && !Z_BRIGHTNESS && !TEXTURE_MAPPING && \
+    !SCREEN_DOOR_ALPHA && MAX_PICK_QUERIES == 0 && !PERSPECTIVE_CORRECT_TEXTURES
+        // Opaque constant-colour kernel (opt-in, -DJET_FLAT_KERNEL=1). A
+        // FLAT/UNLIT triangle with alpha 255 needs no per-pixel state at
+        // all: the exact span stepper gives [left, right] per row and the
+        // row is one fill. Skips the int64 edge-function accumulators, the
+        // Gouraud/water/wireframe/pick row checks and the float reciprocal
+        // below. Pixel output is identical to the general path (same
+        // TriangleSpans, same clamps, same fill helper); triangles the
+        // stepper cannot take (huge coordinates) fall through unchanged.
+        if (plainOpaqueReplace && (emissive || flatColorPrecomputed) &&
+            !wireframeMode && !interlacedMode && !checkerboardMode)
+        {
+            Detail::TriangleSpans fs({v1.position.x, v1.position.y},
+                                     {v2.position.x, v2.position.y},
+                                     {v3.position.x, v3.position.y}, minY, 1);
+            if (fs.valid && minX <= maxX)
+            {
+#if JET_PROFILE
+                const uint32_t jpk = jet_prof_now();
+                jet_prof_cyc[JP_TRI_SETUP] += jpk - jp0; ++jet_prof_cnt[JP_TRI_SETUP];
+                jet_prof_cnt[JP_TRI_ROWS] += (uint32_t)(maxY - fs.firstY + 1);
+#endif
+                const uint16_t wcol = jetWs565(color);
+                const uint32_t wcol32 = ((uint32_t)wcol << 16) | wcol;
+                uint16_t* rowBase = framebuffer + (int32_t)fs.firstY * screenWidth;
+                for (int y = fs.firstY; y <= maxY; ++y, rowBase += screenWidth, fs.advance())
+                {
+                    fs.beginRow(y, 1);
+                    int32_t l = fs.left.x + (fs.left.remainder != 0);
+                    int32_t r = fs.right.x;
+                    if (l < minX) l = minX;
+                    if (r > maxX) r = maxX;
+                    if (l > r) continue;
+                    uint16_t* d = rowBase + l;
+                    int32_t n = r - l + 1;
+                    if ((uintptr_t)d & 2) { *d++ = wcol; --n; }
+                    uint32_t* d32 = reinterpret_cast<uint32_t*>(d);
+                    for (int32_t k = n >> 1; k > 0; --k) *d32++ = wcol32;
+                    if (n & 1) *reinterpret_cast<uint16_t*>(d32) = wcol;
+                }
+#if JET_PROFILE
+                jet_prof_cyc[JP_TRI_ROWS] += jet_prof_now() - jpk;
+#endif
+                return true;
+            }
+        }
+#endif
+
 #if PERSPECTIVE_CORRECT_TEXTURES
         int32_t oneOverZ1 = (FIXED_POINT_SCALE * FIXED_POINT_SCALE) / v1.position.z;
         int32_t oneOverZ2 = (FIXED_POINT_SCALE * FIXED_POINT_SCALE) / v2.position.z;
