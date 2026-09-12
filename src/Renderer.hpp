@@ -54,6 +54,47 @@ struct RenderVertex {
 /// Scene drives this class on every render(). External users normally
 /// access it through `Scene::getRenderer()` rather than constructing one
 /// directly.
+// Per-channel lit-colour modulation shared by the rasterizer and Scene's
+// emit-time flat-colour precompute (see Renderer.cpp for the design notes).
+static inline uint16_t jetModulateRGB565(uint16_t color,
+                                         uint16_t brightness,
+                                         uint8_t ambR, uint8_t ambG, uint8_t ambB,
+                                         uint16_t maxBrightness)
+{
+    const uint32_t base_r = (color >> 11) & 0x1F;
+    const uint32_t base_g = (color >>  5) & 0x3F;
+    const uint32_t base_b =  color        & 0x1F;
+
+    uint32_t tR = (uint32_t)brightness + ambR;
+    uint32_t tG = (uint32_t)brightness + ambG;
+    uint32_t tB = (uint32_t)brightness + ambB;
+    if (tR > maxBrightness) tR = maxBrightness;
+    if (tG > maxBrightness) tG = maxBrightness;
+    if (tB > maxBrightness) tB = maxBrightness;
+
+    auto channel5 = [](uint32_t base5, uint32_t t) -> uint32_t {
+        if (t > 255) {
+            const uint32_t blow = t - 255;
+            return base5 + ((31u - base5) * blow) / 256u;
+        }
+        const uint32_t v = base5 * t;
+        return (v + 128u + (v >> 8)) >> 8;
+    };
+    auto channel6 = [](uint32_t base6, uint32_t t) -> uint32_t {
+        if (t > 255) {
+            const uint32_t blow = t - 255;
+            return base6 + ((63u - base6) * blow) / 256u;
+        }
+        const uint32_t v = base6 * t;
+        return (v + 128u + (v >> 8)) >> 8;
+    };
+
+    const uint32_t r = channel5(base_r, tR);
+    const uint32_t g = channel6(base_g, tG);
+    const uint32_t b = channel5(base_b, tB);
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
 class Rasterizer
 {
     private:
@@ -179,6 +220,13 @@ class Rasterizer
         ///        LAZY_Z is enabled (LAZY_Z needs the max, not the average).
         /// @return True if the triangle produced any rasterizer work.
         bool drawTriangle(const RenderVertex &v1, const RenderVertex &v2, const RenderVertex &v3, Material *material, DirectionalLight *directionalLight, AmbientLight *ambientLight, bool renderEvenLines, bool ignoreZBuffer, bool noWriteZBuffer, int zBias, uint8_t objAlpha = 255, bool brightnessPrecomputed = false, int32_t avgZHint = INT32_MIN);
+#if JET_FLAT_KERNEL
+        /// @brief Opaque constant-colour triangle straight into the framebuffer
+        ///        (wire-order colour, clamps supplied by the caller). Returns the
+        ///        rows walked or -1 if the general path must draw it.
+        int drawFlatOpaque(int32_t x1, int32_t y1, int32_t x2, int32_t y2, int32_t x3, int32_t y3,
+                           int32_t minX, int32_t maxX, int32_t firstRow, int32_t maxY, uint16_t wcol);
+#endif
 
         /// @brief Map an 8-bit grayscale value to RGB565.
         /// @param grayscale 8-bit luminance.

@@ -241,6 +241,10 @@ private:
 #endif
         Material* material;
         int32_t avgZ;
+        // JET_FLAT_KERNEL: FLAT/UNLIT, alpha 255, colour fixed at emit time
+        // (already in wire order): rasterizeBand draws it without drawTriangle.
+        uint16_t flatColor = 0;
+        bool flatOpaque = false;
         // Pack the three booleans together so the UV index replaces
         // padding rather than growing the total payload of textured faces.
         bool ignoreZBuffer : 1;

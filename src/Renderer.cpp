@@ -276,44 +276,6 @@ static inline uint16_t jetShadeBrightness(const Vector3& N, const Vector3& L,
 //
 // Inputs are RGB565 base, 16-bit `brightness` (post-clamp by caller), 8-bit
 // per-channel ambient. Output is RGB565.
-static inline uint16_t jetModulateRGB565(uint16_t color,
-                                         uint16_t brightness,
-                                         uint8_t ambR, uint8_t ambG, uint8_t ambB,
-                                         uint16_t maxBrightness)
-{
-    const uint32_t base_r = (color >> 11) & 0x1F;
-    const uint32_t base_g = (color >>  5) & 0x3F;
-    const uint32_t base_b =  color        & 0x1F;
-
-    uint32_t tR = (uint32_t)brightness + ambR;
-    uint32_t tG = (uint32_t)brightness + ambG;
-    uint32_t tB = (uint32_t)brightness + ambB;
-    if (tR > maxBrightness) tR = maxBrightness;
-    if (tG > maxBrightness) tG = maxBrightness;
-    if (tB > maxBrightness) tB = maxBrightness;
-
-    auto channel5 = [](uint32_t base5, uint32_t t) -> uint32_t {
-        if (t > 255) {
-            const uint32_t blow = t - 255;
-            return base5 + ((31u - base5) * blow) / 256u;
-        }
-        const uint32_t v = base5 * t;
-        return (v + 128u + (v >> 8)) >> 8;
-    };
-    auto channel6 = [](uint32_t base6, uint32_t t) -> uint32_t {
-        if (t > 255) {
-            const uint32_t blow = t - 255;
-            return base6 + ((63u - base6) * blow) / 256u;
-        }
-        const uint32_t v = base6 * t;
-        return (v + 128u + (v >> 8)) >> 8;
-    };
-
-    const uint32_t r = channel5(base_r, tR);
-    const uint32_t g = channel6(base_g, tG);
-    const uint32_t b = channel5(base_b, tB);
-    return (uint16_t)((r << 11) | (g << 5) | b);
-}
 
 namespace Renderer
 {
@@ -490,6 +452,13 @@ jetFlatOpaqueKernel(uint16_t* fb, int32_t stride,
     }
     return rows;
 }
+    // Public entry for Scene::rasterizeBand's direct dispatch (flat-opaque
+    // triangles whose colour was fixed at emit time). Clamps are the caller's.
+    int PERF_CRITICAL Rasterizer::drawFlatOpaque(int32_t x1, int32_t y1, int32_t x2, int32_t y2, int32_t x3, int32_t y3,
+                                                 int32_t minX, int32_t maxX, int32_t firstRow, int32_t maxY, uint16_t wcol)
+    {
+        return jetFlatOpaqueKernel(framebuffer, screenWidth, x1, y1, x2, y2, x3, y3, minX, maxX, firstRow, maxY, wcol);
+    }
 #endif // JET_FLAT_KERNEL
 
     // Separate instantiations let the compiler retain the compact flat-fill

@@ -837,6 +837,38 @@ void Scene::rasterizeBand(int yMin, int yMax, uint8_t* triangleFlags) {
     for (const int32_t idx : renderOrder) {
         if (renderYSpan[2 * idx + 1] < yMin || renderYSpan[2 * idx] >= yMax) continue;
         const RenderTri& t = renderQueue[idx];
+#if JET_FLAT_KERNEL
+        if (t.flatOpaque && !bandRast.wireframeMode && !bandRast.interlacedMode && !bandRast.checkerboardMode) {
+            // drawTriangleImpl's bounding box (even-aligned) and clamps, verbatim
+            const int32_t x1 = t.v1.position.x, x2 = t.v2.position.x, x3 = t.v3.position.x;
+            const int32_t y1 = t.v1.position.y, y2 = t.v2.position.y, y3 = t.v3.position.y;
+            int32_t minX = std::min({x1, x2, x3}) & ~1, maxX = std::max({x1, x2, x3}) & ~1;
+            int32_t minY = std::min({y1, y2, y3}) & ~1, maxY = std::max({y1, y2, y3}) & ~1;
+#if SKIP_ZERO_AREA_TRIANGLES
+            if (minX == maxX || minY == maxY) continue;
+#endif
+            minX = std::max<int32_t>(minX, 0);
+            maxX = std::min<int32_t>(maxX, screenWidth - 1);
+            minY = std::max<int32_t>(minY, yMin);
+            maxY = std::min<int32_t>(maxY, std::min(yMax - 1, screenHeight - 1));
+            if (minY > maxY) continue;
+#if JET_PROFILE
+            const uint32_t jpk = jet_prof_now();
+#endif
+            const int rows = bandRast.drawFlatOpaque(x1, y1, x2, y2, x3, y3, minX, maxX, minY, maxY, t.flatColor);
+            if (rows >= 0) {
+#if JET_PROFILE
+                ++jet_prof_cnt[JP_TRI_SETUP];
+                jet_prof_cnt[JP_TRI_ROWS] += (uint32_t)rows;
+                jet_prof_cyc[JP_TRI_ROWS] += jet_prof_now() - jpk;
+#endif
+                ++rasterized;
+                if (triangleFlags) triangleFlags[idx] = 1;
+                continue;
+            }
+            // huge coordinates / degenerate: fall through to the general path
+        }
+#endif
 #if MAX_PICK_QUERIES > 0
         bandRast.currentPickObject        = t.sourceObject;
         bandRast.currentPickTriangleIndex = t.sourceTriangleIndex;
@@ -1535,6 +1567,36 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
 #if MAX_PICK_QUERIES > 0
         rt.sourceObject        = obj;
         rt.sourceTriangleIndex = srcTriIdx;
+#endif
+#if JET_FLAT_KERNEL && LIGHTING && !Z_BUFFERING && !HALF_WIDTH_BUFFERS && !FIELD_BUFFERS && \
+    !DEBUG_OVERDRAW && !POSTFX_CELLSHADING && !Z_BRIGHTNESS && !TEXTURE_MAPPING && \
+    !SCREEN_DOOR_ALPHA && MAX_PICK_QUERIES == 0 && !PERSPECTIVE_CORRECT_TEXTURES
+        // Same gates as drawTriangleImpl's flat path, evaluated once per
+        // triangle per frame instead of once per band: opaque, no water/additive
+        // blend, no engine depth fog, and either emissive/UNLIT or FLAT with the
+        // object-local Lambert already in v1.
+        rt.flatOpaque = false;
+        if (mat && objAlpha == 255 && mat->alpha == 255 &&
+            mat->shadingMode != ShadingMode::WATER_REFLECT && mat->shadingMode != ShadingMode::ADDITIVE
+#if DEPTH_ALPHA_BLEND && FAST_Z
+            && avgZ <= depthFogNear
+#endif
+           ) {
+            const bool emissive = mat->emissive || mat->shadingMode == ShadingMode::UNLIT;
+            const bool flatShaded = (!directionalLight && !ambientLight) || mat->shadingMode == ShadingMode::FLAT;
+            if (emissive) {
+                rt.flatColor = jetWs565(mat->color);
+                rt.flatOpaque = true;
+            } else if (flatShaded && (rt.brightnessPrecomputed || !directionalLight)) {
+                const uint16_t brightness = directionalLight ? rt.v1.lambertBrightness : 0;
+                const uint8_t ambR = ambientLight ? ambientLight->color.r : 0;
+                const uint8_t ambG = ambientLight ? ambientLight->color.g : 0;
+                const uint8_t ambB = ambientLight ? ambientLight->color.b : 0;
+                rt.flatColor = jetWs565(jetModulateRGB565(mat->color, brightness, ambR, ambG, ambB,
+                                                          (uint16_t)(255u + mat->specular)));
+                rt.flatOpaque = true;
+            }
+        }
 #endif
         renderQueue.push_back(rt);
 #if JET_PROFILE
