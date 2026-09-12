@@ -383,6 +383,115 @@ namespace Renderer
             renderEvenLines,ignoreZBuffer,noWriteZBuffer,zBias,objAlpha,brightnessPrecomputed,avgZHint);
     }
 
+
+#if JET_FLAT_KERNEL
+namespace {
+// Exact rational edge stepper (same arithmetic as Detail::ScanEdge, inc = 1):
+// x = floor(exact intersection), rem/div its fraction.
+struct FlatEdge { int32_t x, step; uint32_t rem, srem, div; };
+
+static inline __attribute__((always_inline))
+void flatEdgeReset(FlatEdge& e, int32_t ax, int32_t ay, int32_t bx, int32_t by, int32_t y)
+{
+    const int32_t dx = bx - ax, dy = by - ay;          // dy > 0 by construction
+    e.div = (uint32_t)dy;
+    int32_t unitStep = dx / dy;
+    int32_t unitRem = dx - unitStep * dy;
+    if (unitRem < 0) { --unitStep; unitRem += dy; }
+    e.step = unitStep;
+    e.srem = (uint32_t)unitRem;
+    const int32_t offset = y - ay;
+    if (offset == 0) { e.x = ax; e.rem = 0; }
+    else if (offset == 1) { e.x = ax + unitStep; e.rem = (uint32_t)unitRem; }
+    else {
+        const int64_t n = (int64_t)dx * offset;
+        int32_t q = (n >= INT32_MIN && n <= INT32_MAX) ? (int32_t)n / dy : (int32_t)(n / dy);
+        int32_t r = (int32_t)(n - (int64_t)q * dy);
+        if (r < 0) { --q; r += dy; }
+        e.x = ax + q;
+        e.rem = (uint32_t)r;
+    }
+}
+} // namespace
+
+// Opaque constant-colour triangle: rows [max(firstRow, top) .. maxY] of the
+// triangle (x1,y1),(x2,y2),(x3,y3), each row one fill clamped to [minX, maxX].
+// Pixel coverage is identical to the general path (same exact stepper, same
+// inclusive left/right rule, same clamps). Returns the number of rows walked,
+// or -1 when the general path must draw it (huge coordinates, degenerate,
+// back-facing, or entirely above the band). Kept out of drawTriangleImpl's
+// frame on purpose: in there the compiler spilled every stepper field to the
+// stack each row (measured 93 cycles per 14-pixel row on an ESP32-S3).
+static int PERF_CRITICAL __attribute__((noinline))
+jetFlatOpaqueKernel(uint16_t* fb, int32_t stride,
+                    int32_t x1, int32_t y1, int32_t x2, int32_t y2, int32_t x3, int32_t y3,
+                    int32_t minX, int32_t maxX, int32_t firstRow, int32_t maxY, uint16_t wcol)
+{
+    constexpr int32_t limit = 1 << 20;
+    if (x1 < -limit || x1 > limit || y1 < -limit || y1 > limit ||
+        x2 < -limit || x2 > limit || y2 < -limit || y2 > limit ||
+        x3 < -limit || x3 > limit || y3 < -limit || y3 > limit) return -1;
+    const int64_t area = (int64_t)(x2 - x1) * (y3 - y1) - (int64_t)(y2 - y1) * (x3 - x1);
+    if (area <= 0) return -1;
+    int32_t ax = x1, ay = y1, bx = x2, by = y2, cx = x3, cy = y3;
+    if (ay > by) { std::swap(ax, bx); std::swap(ay, by); }
+    if (by > cy) { std::swap(bx, cx); std::swap(by, cy); }
+    if (ay > by) { std::swap(ax, bx); std::swap(ay, by); }
+    int32_t y = firstRow;
+    if (y < ay) y = ay;
+    if (y > cy || y > maxY) return -1;
+    const bool shortLeft = (int64_t)(bx - ax) * (cy - ay) < (int64_t)(cx - ax) * (by - ay);
+    // left/right are VALUES (not references into a pair) so the stepper state
+    // stays in registers across the row loop.
+    FlatEdge longE, shortE;
+    int32_t switchY = INT32_MAX;
+    flatEdgeReset(longE, ax, ay, cx, cy, y);
+    if (y < by || by == cy) {
+        flatEdgeReset(shortE, ax, ay, bx, by, y);
+        if (by < cy) switchY = by;
+    } else {
+        flatEdgeReset(shortE, bx, by, cx, cy, y);
+    }
+    FlatEdge left  = shortLeft ? shortE : longE;
+    FlatEdge right = shortLeft ? longE : shortE;
+    const uint32_t wcol32 = ((uint32_t)wcol << 16) | wcol;
+    uint16_t* row = fb + (int32_t)y * stride;
+    const int32_t rows = maxY - y + 1;
+    for (; y <= maxY; ++y, row += stride)
+    {
+        if (y >= switchY) {
+            FlatEdge e; flatEdgeReset(e, bx, by, cx, cy, y);
+            if (shortLeft) left = e; else right = e;
+            switchY = INT32_MAX;
+        }
+        int32_t l = left.x + (left.rem != 0);
+        int32_t r = right.x;
+        if (l < minX) l = minX;
+        if (r > maxX) r = maxX;
+        if (l <= r)
+        {
+            uint16_t* d = row + l;
+            int32_t n = r - l + 1;
+            if ((uintptr_t)d & 2) { *d++ = wcol; --n; }
+            uint32_t* d32 = reinterpret_cast<uint32_t*>(d);
+            for (int32_t k = n >> 1; k > 0; --k) *d32++ = wcol32;
+            if (n & 1) *reinterpret_cast<uint16_t*>(d32) = wcol;
+        }
+        {   // advance both edges (exact carry)
+            uint32_t sum = left.rem + left.srem;
+            bool carry = sum >= left.div;
+            left.x += left.step + carry;
+            left.rem = sum - (carry ? left.div : 0);
+            sum = right.rem + right.srem;
+            carry = sum >= right.div;
+            right.x += right.step + carry;
+            right.rem = sum - (carry ? right.div : 0);
+        }
+    }
+    return rows;
+}
+#endif // JET_FLAT_KERNEL
+
     // Separate instantiations let the compiler retain the compact flat-fill
     // kernel in a texture-enabled build, without UV/general-loop register
     // pressure spilling into the overwhelmingly common untextured path.
@@ -390,6 +499,8 @@ namespace Renderer
 #if defined(ESP_PLATFORM)
     __attribute__((always_inline))
 #endif
+
+
     inline bool Rasterizer::drawTriangleImpl(
         const RenderVertex &v1,
         const RenderVertex &v2,
@@ -837,35 +948,17 @@ namespace Renderer
         if (plainOpaqueReplace && (emissive || flatColorPrecomputed) &&
             !wireframeMode && !interlacedMode && !checkerboardMode)
         {
-            Detail::TriangleSpans fs({v1.position.x, v1.position.y},
-                                     {v2.position.x, v2.position.y},
-                                     {v3.position.x, v3.position.y}, minY, 1);
-            if (fs.valid && minX <= maxX)
+#if JET_PROFILE
+            const uint32_t jpk = jet_prof_now();
+#endif
+            const int rowsDone = jetFlatOpaqueKernel(framebuffer, screenWidth,
+                                     v1.position.x, v1.position.y, v2.position.x, v2.position.y,
+                                     v3.position.x, v3.position.y, minX, maxX, minY, maxY, jetWs565(color));
+            if (rowsDone >= 0)
             {
 #if JET_PROFILE
-                const uint32_t jpk = jet_prof_now();
                 jet_prof_cyc[JP_TRI_SETUP] += jpk - jp0; ++jet_prof_cnt[JP_TRI_SETUP];
-                jet_prof_cnt[JP_TRI_ROWS] += (uint32_t)(maxY - fs.firstY + 1);
-#endif
-                const uint16_t wcol = jetWs565(color);
-                const uint32_t wcol32 = ((uint32_t)wcol << 16) | wcol;
-                uint16_t* rowBase = framebuffer + (int32_t)fs.firstY * screenWidth;
-                for (int y = fs.firstY; y <= maxY; ++y, rowBase += screenWidth, fs.advance())
-                {
-                    fs.beginRow(y, 1);
-                    int32_t l = fs.left.x + (fs.left.remainder != 0);
-                    int32_t r = fs.right.x;
-                    if (l < minX) l = minX;
-                    if (r > maxX) r = maxX;
-                    if (l > r) continue;
-                    uint16_t* d = rowBase + l;
-                    int32_t n = r - l + 1;
-                    if ((uintptr_t)d & 2) { *d++ = wcol; --n; }
-                    uint32_t* d32 = reinterpret_cast<uint32_t*>(d);
-                    for (int32_t k = n >> 1; k > 0; --k) *d32++ = wcol32;
-                    if (n & 1) *reinterpret_cast<uint16_t*>(d32) = wcol;
-                }
-#if JET_PROFILE
+                jet_prof_cnt[JP_TRI_ROWS] += (uint32_t)rowsDone;
                 jet_prof_cyc[JP_TRI_ROWS] += jet_prof_now() - jpk;
 #endif
                 return true;
