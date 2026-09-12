@@ -226,6 +226,16 @@ Scene::~Scene() {
     }
 }
 
+void Scene::reserveQueues(size_t n) {
+    renderQueue.reserve(n);
+    renderBuckets.reserve(n);
+    renderYSpan.reserve(2 * n);
+    renderOrder.reserve(n);
+#if TEXTURE_MAPPING
+    textureQueue.reserve(n);
+#endif
+}
+
 void Scene::setFramebuffer(uint16_t *newBuffer) {
     framebuffer = newBuffer;
     renderer->setFramebuffer(newBuffer);

@@ -124,6 +124,11 @@ public:
     /// @param framebuffer New caller-owned RGB565 buffer.
     void setFramebuffer(uint16_t *framebuffer);
 
+    /// @brief Pre-size the per-frame render queues for n triangles. Call once
+    ///        after construction so the vectors are allocated where you want
+    ///        them (e.g. before external-RAM fallback kicks in on an ESP32-S3).
+    void reserveQueues(size_t n);
+
     /// @brief Enable or disable per-frame framebuffer clearing.
     /// @param clear True to clear before rendering, false to preserve previous content.
     void setClearBuffer(bool clear) { clearRenderBuffer = clear; }
