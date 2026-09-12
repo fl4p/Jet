@@ -1531,7 +1531,11 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
                 constexpr int K = SortBucketCount - 2;
                 const int32_t key = avgZ - static_cast<int32_t>(obj->zBias) * zBiasScale;
                 const int32_t range = std::max<int32_t>(camera->farPlane - camera->nearPlane, 1);
-                int b = static_cast<int>((static_cast<int64_t>(key - camera->nearPlane) * K) / range);
+                // Q16 fixed-point scale instead of a 64-bit divide per triangle
+                // (__divdi3 is ~100 cycles on an LX7); exact for the key ranges
+                // a 32-bit key can take because the product stays in int64.
+                const int64_t scaleQ16 = ((int64_t)K << 16) / range;   // hoisted by the compiler? no: cheap enough
+                int b = static_cast<int>(((static_cast<int64_t>(key - camera->nearPlane) * scaleQ16) >> 16));
                 b = std::max(0, std::min(b, K - 1));
                 bucket = static_cast<uint8_t>(K - b);
             }
