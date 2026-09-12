@@ -634,6 +634,7 @@ void Scene::prepareFrame() {
 
     renderQueue.clear();
     renderBuckets.clear();
+    renderYSpan.clear();
 #if TEXTURE_MAPPING
     textureQueue.clear();
 #endif
@@ -824,9 +825,8 @@ void Scene::rasterizeBand(int yMin, int yMax, uint8_t* triangleFlags) {
     // denom) return false and don't count toward the rasterized total.
     int rasterized = 0;
     for (const int32_t idx : renderOrder) {
+        if (renderYSpan[2 * idx + 1] < yMin || renderYSpan[2 * idx] >= yMax) continue;
         const RenderTri& t = renderQueue[idx];
-        if (std::max({t.v1.position.y, t.v2.position.y, t.v3.position.y}) < yMin ||
-            std::min({t.v1.position.y, t.v2.position.y, t.v3.position.y}) >= yMax) continue;
 #if MAX_PICK_QUERIES > 0
         bandRast.currentPickObject        = t.sourceObject;
         bandRast.currentPickTriangleIndex = t.sourceTriangleIndex;
@@ -1521,6 +1521,12 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
             }
         }
         renderBuckets.push_back(bucket);
+        {
+            const int32_t ylo = std::min({a.position.y, b.position.y, c.position.y});
+            const int32_t yhi = std::max({a.position.y, b.position.y, c.position.y});
+            renderYSpan.push_back((int16_t)std::max<int32_t>(-32768, std::min<int32_t>(32767, ylo)));
+            renderYSpan.push_back((int16_t)std::max<int32_t>(-32768, std::min<int32_t>(32767, yhi)));
+        }
     };
 
     // Render triangles with backface culling and shading

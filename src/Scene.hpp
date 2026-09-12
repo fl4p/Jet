@@ -262,6 +262,10 @@ private:
     // then overlay. Sorting never needs to fetch the full triangle payload.
     static constexpr int SortBucketCount = 66;
     std::vector<uint8_t> renderBuckets;
+    // Per-queued-triangle screen y extent (min, max) clamped to int16, captured
+    // at emit time so rasterizeBand() can reject out-of-band triangles without
+    // touching the (possibly external-RAM) RenderTri itself.
+    std::vector<int16_t> renderYSpan;
     // Painter's-sort output as indices into renderQueue, rebuilt by
     // prepareFrame() each frame. Sorting (scattering) 4-byte indices
     // instead of whole RenderTri structs avoids a full second copy of the
