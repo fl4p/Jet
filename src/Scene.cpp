@@ -1566,7 +1566,8 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         const uint32_t jpe1 = jet_prof_now(); jet_prof_cyc[JP_EMIT_CULL] += jpe1 - jpe.t0;
 #endif
 
-        RenderTri rt;
+        renderQueue.emplace_back();
+        RenderTri& rt = renderQueue.back();          // built in place: no 80-byte stack copy
         const bool reverse = cullingMode == CullingMode::NO_CULLING && shoelaceArea < 0;
         if (reverse) {
             rt.v1.assign(c); rt.v2.assign(b); rt.v3.assign(a);
@@ -1626,7 +1627,6 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
             }
         }
 #endif
-        renderQueue.push_back(rt);
 #if JET_PROFILE
         const uint32_t jpe2 = jet_prof_now(); jet_prof_cyc[JP_EMIT_BUILD] += jpe2 - jpe1; ++jet_prof_cnt[JP_EMIT_BUILD];
 #endif
