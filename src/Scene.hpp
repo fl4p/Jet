@@ -288,7 +288,6 @@ private:
     // instead of whole RenderTri structs avoids a full second copy of the
     // queue per frame; rasterizeBand() walks this to draw in depth order.
     std::vector<int32_t> renderOrder;
-    int32_t sortScaleQ16 = 0;   // (SortBucketCount-2) << 16 / (far - near), per frame
     static constexpr int MaxBandLists = 8;
     std::vector<int32_t> bandOrder[MaxBandLists];   // buildBandLists() output
     int bandListRows = 0;                           // rows per band the lists were built for (0 = none)

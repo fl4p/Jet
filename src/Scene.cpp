@@ -661,10 +661,6 @@ void Scene::prepareFrame() {
     renderQueue.clear();
     renderBuckets.clear();
     renderYSpan.clear();
-    {
-        const int32_t range = std::max<int32_t>(camera->farPlane - camera->nearPlane, 1);
-        sortScaleQ16 = (int32_t)(((int64_t)(SortBucketCount - 2) << 16) / range);
-    }
     bandListRows = 0;
 
 #if TEXTURE_MAPPING
@@ -1639,9 +1635,14 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
                 constexpr int32_t zBiasScale = 256;
                 constexpr int K = SortBucketCount - 2;
                 const int32_t key = avgZ - static_cast<int32_t>(obj->zBias) * zBiasScale;
-                // Q16 fixed-point scale (computed once per frame in prepareFrame)
-                // instead of a 64-bit divide per triangle; 32x32->64 multiply.
-                int b = static_cast<int>(((int64_t)(int32_t)(key - camera->nearPlane) * (int32_t)sortScaleQ16) >> 16);
+                const int32_t range = std::max<int32_t>(camera->farPlane - camera->nearPlane, 1);
+                // Exact old bucket formula; the 32-bit hardware divide when the
+                // product fits (always, for world-scale keys), int64 otherwise.
+                // (A Q16 reciprocal moved keys across bucket edges: reviewer finding.)
+                const int32_t rel = key - camera->nearPlane;
+                int b = (rel > -(INT32_MAX / K) && rel < INT32_MAX / K)
+                      ? (rel * K) / range
+                      : static_cast<int>((static_cast<int64_t>(rel) * K) / range);
                 b = std::max(0, std::min(b, K - 1));
                 bucket = static_cast<uint8_t>(K - b);
             }
