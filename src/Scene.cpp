@@ -1305,7 +1305,22 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         // Perspective projection — float fovFactor lets us use a reciprocal
         // multiply instead of 64-bit integer divide, leveraging the hardware
         // FPU on ESP32-S3/P4 (64-bit div is software-emulated on those cores).
+#if defined(__XTENSA__) && defined(ESP_PLATFORM)
+        // The LX7 FPU has no divide: 1/z through __divsf3 in ROM costs ~100
+        // cycles per vertex. recip0.s seed + two Newton steps gives full
+        // float precision in ~10 cycles.
+        float invZ;
+        {
+            const float fz = (float)pos.z;
+            float r;
+            __asm__("recip0.s %0, %1" : "=f"(r) : "f"(fz));
+            r = r * (2.0f - fz * r);
+            r = r * (2.0f - fz * r);
+            invZ = fovFactor * r;
+        }
+#else
         const float invZ = fovFactor / (float)pos.z;
+#endif
         dst.position.x = (int32_t)(pos.x * invZ) + screenWidth / 2;
         dst.position.y = screenHeight / 2 - (int32_t)(pos.y * invZ);
         dst.position.z = pos.z;
