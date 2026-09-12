@@ -128,6 +128,12 @@ public:
     ///        after construction so the vectors are allocated where you want
     ///        them (e.g. before external-RAM fallback kicks in on an ESP32-S3).
     void reserveQueues(size_t n);
+    /// @brief After prepareFrame(): split renderOrder into per-band index lists for
+    ///        bands of `bandRows` rows (screenHeight / bandRows + 1 lists, painter's
+    ///        order preserved). rasterizeBand(y0, y1) then walks only the list of the
+    ///        band that starts at y0 (when y0 % bandRows == 0 and y1 - y0 <= bandRows)
+    ///        instead of testing every queued triangle against the band.
+    void buildBandLists(int bandRows);
     /// @brief Storage address of the render queue (placement diagnostics).
     const void* queueStorage() const { return renderQueue.data(); }
 
@@ -283,6 +289,9 @@ private:
     // queue per frame; rasterizeBand() walks this to draw in depth order.
     std::vector<int32_t> renderOrder;
     int32_t sortScaleQ16 = 0;   // (SortBucketCount-2) << 16 / (far - near), per frame
+    static constexpr int MaxBandLists = 8;
+    std::vector<int32_t> bandOrder[MaxBandLists];   // buildBandLists() output
+    int bandListRows = 0;                           // rows per band the lists were built for (0 = none)
 
     Camera* camera;
     DirectionalLight* directionalLight;

@@ -228,12 +228,28 @@ Scene::~Scene() {
 
 void Scene::reserveQueues(size_t n) {
     renderQueue.reserve(n);
+    for (auto& v : bandOrder) v.reserve(n / 2);
     renderBuckets.reserve(n);
     renderYSpan.reserve(2 * n);
     renderOrder.reserve(n);
 #if TEXTURE_MAPPING
     textureQueue.reserve(n);
 #endif
+}
+
+void Scene::buildBandLists(int bandRows) {
+    bandListRows = 0;
+    if (bandRows <= 0) return;
+    const int nb = (screenHeight + bandRows - 1) / bandRows;
+    if (nb > MaxBandLists) return;
+    for (int b = 0; b < nb; ++b) bandOrder[b].clear();
+    for (const int32_t idx : renderOrder) {
+        int b0 = renderYSpan[2 * idx] / bandRows, b1 = renderYSpan[2 * idx + 1] / bandRows;
+        if (b0 < 0) b0 = 0;
+        if (b1 >= nb) b1 = nb - 1;
+        for (int b = b0; b <= b1; ++b) bandOrder[b].push_back(idx);
+    }
+    bandListRows = bandRows;
 }
 
 void Scene::setFramebuffer(uint16_t *newBuffer) {
@@ -649,6 +665,8 @@ void Scene::prepareFrame() {
         const int32_t range = std::max<int32_t>(camera->farPlane - camera->nearPlane, 1);
         sortScaleQ16 = (int32_t)(((int64_t)(SortBucketCount - 2) << 16) / range);
     }
+    bandListRows = 0;
+
 #if TEXTURE_MAPPING
     textureQueue.clear();
 #endif
@@ -839,8 +857,13 @@ void Scene::rasterizeBand(int yMin, int yMax, uint8_t* triangleFlags) {
     // inside drawTriangle (alpha=0, zero-area, near/far Z, degenerate
     // denom) return false and don't count toward the rasterized total.
     int rasterized = 0;
-    for (const int32_t idx : renderOrder) {
-        if (renderYSpan[2 * idx + 1] < yMin || renderYSpan[2 * idx] >= yMax) continue;
+    // Per-band list when the caller built one for this band layout, else the
+    // full painter's order with a per-triangle y-span test.
+    const bool useList = bandListRows > 0 && yMin % bandListRows == 0 && yMax - yMin <= bandListRows
+                         && yMin / bandListRows < MaxBandLists;
+    const std::vector<int32_t>& walk = useList ? bandOrder[yMin / bandListRows] : renderOrder;
+    for (const int32_t idx : walk) {
+        if (!useList && (renderYSpan[2 * idx + 1] < yMin || renderYSpan[2 * idx] >= yMax)) continue;
         const RenderTri& t = renderQueue[idx];
 #if JET_FLAT_KERNEL
         if (t.flatOpaque && !bandRast.wireframeMode && !bandRast.interlacedMode && !bandRast.checkerboardMode) {
