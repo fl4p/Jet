@@ -101,6 +101,11 @@ public:
     /// 0 disables.
     int8_t zBias = 0;
 
+    /// @brief Per-frame depth sort of this object's own triangles (SORT_TRIANGLES builds).
+    /// Only the order inside one painter's bucket depends on it; set false for large
+    /// static meshes to save the sort (an ESP32-S3 heightfield measured 0.7 ms/frame).
+    bool sortTriangles = true;
+
     bool transformScale = false;    ///< When true, scale is included in the world transform; otherwise scale is baked-in.
     bool enabled = true;            ///< When false, the object is skipped entirely.
 

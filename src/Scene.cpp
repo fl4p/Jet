@@ -1300,7 +1300,13 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
     }
 
 #if SORT_TRIANGLES
-    // Sort the triangles by depth
+    // Sort the triangles by depth. Only intra-bucket order of the global
+    // painter's bucket sort depends on this (buckets are stable by insertion);
+    // Object::sortTriangles = false skips it for meshes whose triangles never
+    // need intra-bucket ordering (measured 2026-09-12 on an ESP32-S3: 0.7 ms
+    // per frame for a 65-object heightfield). Objects in the ignoreZBuffer
+    // overlay band rely on it for their own back-to-front order.
+    if (obj->sortTriangles)
     std::sort(meshSource->triangles.begin(), meshSource->triangles.end(), [&](const Object::Triangle& a, const Object::Triangle& b) {
         const auto& v1 = transformedVertices[a.v1];
         const auto& v2 = transformedVertices[a.v2];
