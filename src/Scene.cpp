@@ -4,6 +4,9 @@
 #include "BlendSpans.hpp"
 #include "WireSwap565.hpp"
 #include "JetConfig.hpp"
+#if JET_PROFILE
+#include "JetProf.hpp"
+#endif
 #include <cstring> // For memset
 #include <algorithm> // For std::min, std::max
 #include <cmath> // For sqrtf (per-object distance fade / LOD pick)
@@ -512,6 +515,9 @@ void PERF_CRITICAL Scene::clearBuffers() {
 
 void Scene::prepareFrame() {
     if (!camera) return;
+#if JET_PROFILE
+    uint32_t jp0 = jet_prof_now();
+#endif
     // renderEvenLines drives the frame-parity selection used by both interlaced
     // and checkerboard modes.  In interlaced mode it selects which rows to draw;
     // in checkerboard mode it selects which (x+y) pixel parity to draw.  When
@@ -744,6 +750,9 @@ void Scene::prepareFrame() {
     lastFrameDrawnObjects   = drawnObjs;
     lastFrameDrawnTriangles = static_cast<int>(renderQueue.size());
 
+#if JET_PROFILE
+    { const uint32_t jp1 = jet_prof_now(); jet_prof_cyc[JP_XFORM] += jp1 - jp0; jp0 = jp1; }
+#endif
     // 3) Global painter's sort. Three bands:
     //      0. noWriteZBuffer  — drawn first, so later geometry paints over
     //                           them (e.g. skyboxes).
@@ -786,6 +795,9 @@ void Scene::prepareFrame() {
             renderOrder[0] = 0;
         }
     }
+#if JET_PROFILE
+    jet_prof_cyc[JP_SORT] += jet_prof_now() - jp0; ++jet_prof_cnt[JP_SORT];
+#endif
 }  // end prepareFrame()
 
 void Scene::clearBand(int yMin, int yMax) {
@@ -796,6 +808,9 @@ void Scene::clearBand(int yMin, int yMax) {
 }
 
 void Scene::rasterizeBand(int yMin, int yMax, uint8_t* triangleFlags) {
+#if JET_PROFILE
+    const uint32_t jp0 = jet_prof_now();
+#endif
     // Create a thread-local copy of the rasteriser so each band worker has
     // its own yBandMin/yBandMax. Only framebuffer/zbuffer ptrs are shared;
     // writes go to non-overlapping y regions so there is no write race.
@@ -837,6 +852,9 @@ void Scene::rasterizeBand(int yMin, int yMax, uint8_t* triangleFlags) {
         }
     }
     if (!triangleFlags) lastFrameRasterizedTriangles = rasterized;
+#if JET_PROFILE
+    jet_prof_cyc[JP_BAND_WALK] += jet_prof_now() - jp0; ++jet_prof_cnt[JP_BAND_WALK];
+#endif
 }
 
 void Scene::render(RasterExecutor executor) {
@@ -1006,6 +1024,9 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
                                      int32_t camCosZ, int32_t camSinZ,
                                      uint8_t objAlpha,
                                      Object* meshSource) {
+#if JET_PROFILE
+    const uint32_t jpo0 = jet_prof_now();
+#endif
     // meshSource decouples "which mesh do we rasterise" from "where / how
     // does the object live in the world". Defaults to obj itself, so the
     // non-LOD path is unchanged. When the global LOD system picks a
@@ -1257,6 +1278,11 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
 
     // Transform vertices and normals, writing only live projected attributes.
     const Vector3* packedPositions = meshSource->cachedPositions();
+#if JET_PROFILE
+    jet_prof_cnt[JP_XFORM] += (uint32_t)vertCount;
+    const uint32_t jpv0 = jet_prof_now();
+    jet_prof_cyc[JP_OBJ] += jpv0 - jpo0;
+#endif
     for (size_t vi = 0; vi < vertCount; ++vi) {
         const Object::Vertex& srcVert = meshSource->vertices[vi];
         PipelineVertex& dst = transformedVertices[vi];
@@ -1299,6 +1325,9 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
 #endif
     }
 
+#if JET_PROFILE
+    jet_prof_cyc[JP_VERTS] += jet_prof_now() - jpv0;
+#endif
 #if SORT_TRIANGLES
     // Sort the triangles by depth. Only intra-bucket order of the global
     // painter's bucket sort depends on this (buckets are stable by insertion);

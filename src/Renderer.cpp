@@ -7,6 +7,11 @@
 #include "BlendSpans.hpp"
 #include "WireSwap565.hpp"
 #include <type_traits>
+#if JET_PROFILE
+#include "JetProf.hpp"
+uint32_t jet_prof_cyc[JP_N];
+uint32_t jet_prof_cnt[JP_N];
+#endif
 
 #if JET_WIRE_SWAP && (TEXTURE_MAPPING || Z_BUFFERING || SCREEN_DOOR_ALPHA || HALF_WIDTH_BUFFERS || FIELD_BUFFERS)
 #error "JET_WIRE_SWAP covers only the flat painter's clear/span/fog paths"
@@ -400,6 +405,9 @@ namespace Renderer
         bool brightnessPrecomputed,
         int32_t avgZHint)
     {
+#if JET_PROFILE
+        const uint32_t jp0 = jet_prof_now();
+#endif
         // Fold per-object fade alpha into the material alpha up front so
         // every downstream alpha decision (early-out, depth fog, stipple
         // under SCREEN_DOOR_ALPHA, traditional blend without it) sees the
@@ -1923,8 +1931,16 @@ namespace Renderer
     #undef JET_UV_STEP
             }
         };
+#if JET_PROFILE
+        const uint32_t jp1 = jet_prof_now();
+        jet_prof_cyc[JP_TRI_SETUP] += jp1 - jp0; ++jet_prof_cnt[JP_TRI_SETUP];
+        jet_prof_cnt[JP_TRI_ROWS] += (uint32_t)((maxY - yStart) / inc + 1);
+#endif
         if (spans.valid) rasterRows(std::true_type{});
         else rasterRows(std::false_type{});
+#if JET_PROFILE
+        jet_prof_cyc[JP_TRI_ROWS] += jet_prof_now() - jp1;
+#endif
 
         return true;
     }
