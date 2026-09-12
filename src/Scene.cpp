@@ -1251,7 +1251,7 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
     uint16_t objLightIntensity = 0;
     uint8_t  objDiffuseCoef = 255;
     if (directionalLight && !meshSource->triangles.empty()) {
-        bool allNonSpecular = obj->lightHint != 0;   // hint 1/2: skip the walk
+        bool allNonSpecular = true;                  // hint 1/2: known, skip the walk; hint 0: scan below
         // Per-triangle material walk. Cheap — a handful of byte loads
         // per face — and exits early on the first specular material we
         // hit so specular-heavy objects (vehicles with shiny paint)
@@ -1613,7 +1613,8 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
                 rt.flatColor = jetWs565(mat->color);
                 rt.flatOpaque = true;
             } else if (flatShaded && (rt.brightnessPrecomputed || !directionalLight)) {
-                const uint16_t brightness = directionalLight ? rt.v1.lambertBrightness : 0;
+                // drawTriangleImpl: no lights at all -> full brightness; ambient only -> 0 (tint)
+                const uint16_t brightness = directionalLight ? rt.v1.lambertBrightness : (ambientLight ? 0 : 255);
                 const uint8_t ambR = ambientLight ? ambientLight->color.r : 0;
                 const uint8_t ambG = ambientLight ? ambientLight->color.g : 0;
                 const uint8_t ambB = ambientLight ? ambientLight->color.b : 0;
