@@ -6,6 +6,15 @@
 
 namespace Renderer::Detail {
 
+// Everything here runs per row inside the IRAM rasterizer kernels. Out-of-line
+// these were windowed calls into flash-cached code (measured 2026-09-12 on an
+// ESP32-S3: three callx8 per row, ~110 cycles/row for a 14-pixel span).
+#if defined(__GNUC__)
+#define JET_SPAN_INLINE inline __attribute__((always_inline))
+#else
+#define JET_SPAN_INLINE inline
+#endif
+
 struct SpanPoint { int32_t x, y; };
 
 struct ScanEdge {
@@ -15,7 +24,7 @@ struct ScanEdge {
     // Requires a.y < b.y and inc in {1,2}. x/remainder represent the
     // exact intersection as floor(x) plus a nonnegative fraction. Keeping
     // the remainder avoids fixed-point drift at inclusive triangle edges.
-    void reset(SpanPoint a, SpanPoint b, int32_t y, int inc) {
+    JET_SPAN_INLINE void reset(SpanPoint a, SpanPoint b, int32_t y, int inc) {
         const int32_t dx = b.x - a.x;
         const int32_t dy = b.y - a.y;
         divisor = (uint32_t)dy;
@@ -41,7 +50,7 @@ struct ScanEdge {
         }
     }
 
-    void advance() {
+    JET_SPAN_INLINE void advance() {
         const uint32_t sum = remainder + stepRemainder;
         const bool carry = sum >= divisor;
         x += step + carry;
@@ -60,7 +69,7 @@ struct TriangleSpans {
     int32_t firstY = 0, switchY = INT32_MAX;
     bool shortLeft = false, valid = false;
 
-    TriangleSpans(SpanPoint a, SpanPoint b, SpanPoint c, int32_t y, int inc) {
+    JET_SPAN_INLINE TriangleSpans(SpanPoint a, SpanPoint b, SpanPoint c, int32_t y, int inc) {
         constexpr int32_t limit = 1 << 20;
         for (const auto p : {a,b,c})
             if (p.x < -limit || p.x > limit || p.y < -limit || p.y > limit) return;
@@ -84,14 +93,14 @@ struct TriangleSpans {
         valid = true;
     }
 
-    void beginRow(int32_t y, int inc) {
+    JET_SPAN_INLINE void beginRow(int32_t y, int inc) {
         if (y >= switchY) {
             (shortLeft ? left : right).reset(middle,bottom,y,inc);
             switchY = INT32_MAX;
         }
     }
 
-    void advance() { left.advance(); right.advance(); }
+    JET_SPAN_INLINE void advance() { left.advance(); right.advance(); }
 };
 
 } // namespace Renderer::Detail
