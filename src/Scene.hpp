@@ -128,6 +128,8 @@ public:
     ///        after construction so the vectors are allocated where you want
     ///        them (e.g. before external-RAM fallback kicks in on an ESP32-S3).
     void reserveQueues(size_t n);
+    /// @brief Storage address of the render queue (placement diagnostics).
+    const void* queueStorage() const { return renderQueue.data(); }
 
     /// @brief Enable or disable per-frame framebuffer clearing.
     /// @param clear True to clear before rendering, false to preserve previous content.
