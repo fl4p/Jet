@@ -1474,6 +1474,9 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         // depthFogFar == farPlane in the current build, so this also
         // subsumes the depth-fog alpha=0 early-out that drawTriangle
         // would have done after a full setup.
+#if JET_PROFILE
+        struct JpEmitScope { uint32_t t0; ~JpEmitScope() { jet_prof_cyc[JP_EMIT] += jet_prof_now() - t0; ++jet_prof_cnt[JP_EMIT]; } } jpe{jet_prof_now()};
+#endif
         const int32_t avgZ = (a.position.z + b.position.z + c.position.z) / 3;
         if (avgZ > camera->farPlane || avgZ < camera->nearPlane) return;
 
@@ -1499,6 +1502,9 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
             case CullingMode::NO_CULLING: break;
         }
         if (shouldCull) return;
+#if JET_PROFILE
+        const uint32_t jpe1 = jet_prof_now(); jet_prof_cyc[JP_EMIT_CULL] += jpe1 - jpe.t0;
+#endif
 
         RenderTri rt;
         const bool reverse = cullingMode == CullingMode::NO_CULLING && shoelaceArea < 0;
@@ -1531,6 +1537,9 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         rt.sourceTriangleIndex = srcTriIdx;
 #endif
         renderQueue.push_back(rt);
+#if JET_PROFILE
+        const uint32_t jpe2 = jet_prof_now(); jet_prof_cyc[JP_EMIT_BUILD] += jpe2 - jpe1; ++jet_prof_cnt[JP_EMIT_BUILD];
+#endif
         // Preserve the old stable 64-bucket ordering exactly, including
         // noWriteZBuffer taking precedence when both special flags are set.
         uint8_t bucket = 0;
@@ -1557,6 +1566,9 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
             renderYSpan.push_back((int16_t)std::max<int32_t>(-32768, std::min<int32_t>(32767, ylo)));
             renderYSpan.push_back((int16_t)std::max<int32_t>(-32768, std::min<int32_t>(32767, yhi)));
         }
+#if JET_PROFILE
+        jet_prof_cyc[JP_EMIT_TAIL] += jet_prof_now() - jpe2;
+#endif
     };
 
     // Render triangles with backface culling and shading
