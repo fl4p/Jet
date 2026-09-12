@@ -106,6 +106,12 @@ public:
     /// static meshes to save the sort (an ESP32-S3 heightfield measured 0.7 ms/frame).
     bool sortTriangles = true;
 
+    /// @brief Lighting precompute hint for Scene::renderObject (LIGHTING builds).
+    /// 0 = scan the materials every frame (default), 1 = all materials are known
+    /// non-specular (object-local Lambert per vertex, no scan), 2 = all materials
+    /// are UNLIT/emissive: no scan, no per-vertex Lambert at all.
+    uint8_t lightHint = 0;
+
     bool transformScale = false;    ///< When true, scale is included in the world transform; otherwise scale is baked-in.
     bool enabled = true;            ///< When false, the object is skipped entirely.
 

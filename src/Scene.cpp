@@ -1185,7 +1185,7 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
     uint16_t objLightIntensity = 0;
     uint8_t  objDiffuseCoef = 255;
     if (directionalLight && !meshSource->triangles.empty()) {
-        bool allNonSpecular = true;
+        bool allNonSpecular = obj->lightHint != 0;   // hint 1/2: skip the walk
         // Per-triangle material walk. Cheap — a handful of byte loads
         // per face — and exits early on the first specular material we
         // hit so specular-heavy objects (vehicles with shiny paint)
@@ -1198,6 +1198,7 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         // (view-space) and there's no place to feed cached brightness
         // back in. FLAT and GOURAUD both consume a per-triangle/vertex
         // scalar brightness so they slot the cache in cleanly.
+        if (obj->lightHint == 0)
         for (const auto& tri : meshSource->triangles) {
             if (!tri.material) continue;
             if (tri.material->specular != 0 ||
@@ -1319,7 +1320,7 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         // verts of a face share the same normal (computeFlatNormals
         // stamps identical normals) so the per-triangle FLAT path can
         // pick any one — it uses v1 already.
-        dst.lambertBrightness = objectLocalLight
+        dst.lambertBrightness = (objectLocalLight && obj->lightHint != 2)
             ? sceneLambertDiffuse(normal, objLightDir, objLightIntensity, objDiffuseCoef)
             : 0;
 #endif
