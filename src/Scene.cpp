@@ -656,6 +656,7 @@ void Scene::prepareFrame() {
 
     for (auto obj : objects) {
         if (!obj->enabled) continue;
+        if (obj->triangles.empty() && obj->lodMeshes.empty()) continue;   // nothing to draw: skip the per-object setup
         // 1) Quick sphere far-cull before the expensive 8-corner AABB test.
         //    distSq to the object centre is computed unconditionally so it
         //    is also available for the fade ramps and LOD pick below,
