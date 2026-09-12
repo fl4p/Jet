@@ -464,7 +464,8 @@ void PERF_CRITICAL Scene::clearBuffers() {
             // assigned to this band (critical for virtual-base-pointer band
             // rendering where the buffer only covers [yBandMin, yBandMax)).
             const int yClearStart = renderer ? renderer->yBandMin             : 0;
-            const int yClearEnd   = renderer ? std::min(renderer->yBandMax, rowCount) : rowCount;
+            int yClearEnd   = renderer ? std::min(renderer->yBandMax, rowCount) : rowCount;
+            if (backgroundClearMaxRows > 0) yClearEnd = std::min(yClearEnd, backgroundClearMaxRows);
             for (int y = yClearStart; y < yClearEnd; ++y) {
                 #if DEBUG_OVERDRAW
                 const uint16_t lineColor = 0;

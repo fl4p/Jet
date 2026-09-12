@@ -175,6 +175,10 @@ public:
 
 
     uint16_t* backgroundGradientColors = nullptr;   ///< Optional per-row background gradient (screenHeight entries) used during clear.
+    /// If > 0, the clear fills only rows [0, backgroundClearMaxRows): below the
+    /// horizon the ground plane rewrites every pixel each frame, so clearing
+    /// them is pure PSRAM bandwidth waste (used by the flight scene).
+    int backgroundClearMaxRows = 0;
 
     /// @name Distance-based level of detail (LOD)
     /// @brief Global LOD selection driven by camera-to-object distance.
