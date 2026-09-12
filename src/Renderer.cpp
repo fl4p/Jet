@@ -668,7 +668,10 @@ namespace Renderer
         // Precompute FPU reciprocal once per triangle. Replaces two int64
         // __divdi3 calls (per-triangle Gouraud step + per-row brightness
         // init) with float multiplies — ~70 cy → ~5 cy each on Xtensa LX7.
-        const float invDenom64f = 1.0f / (float)denom64;
+        // Only the Gouraud setup/rows use it: the int64->float and the software
+        // float divide (~150 cycles on an LX7) are skipped for FLAT/UNLIT.
+        const float invDenom64f = (directionalLight && material->shadingMode == ShadingMode::GOURAUD)
+                                ? 1.0f / (float)denom64 : 0.0f;
 #endif
 
 #if TEXTURE_MAPPING && !PERSPECTIVE_CORRECT_TEXTURES
