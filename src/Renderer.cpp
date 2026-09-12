@@ -5,7 +5,12 @@
 #include "FastMath.hpp"
 #include "TriangleSpans.hpp"
 #include "BlendSpans.hpp"
+#include "WireSwap565.hpp"
 #include <type_traits>
+
+#if JET_WIRE_SWAP && (TEXTURE_MAPPING || Z_BUFFERING || SCREEN_DOOR_ALPHA || HALF_WIDTH_BUFFERS || FIELD_BUFFERS)
+#error "JET_WIRE_SWAP covers only the flat painter's clear/span/fog paths"
+#endif
 
 #if defined(CHECKERBOARD_MODE) && CHECKERBOARD_MODE && defined(FIELD_BUFFERS) && FIELD_BUFFERS
 #error "CHECKERBOARD_MODE and FIELD_BUFFERS (interlaced) cannot both be enabled. Each would render only one quarter of pixels per frame and interact destructively. Pick one."
@@ -80,6 +85,7 @@ static inline uint16_t addBlendRGB565(uint16_t dst, uint16_t src, uint8_t alpha)
 static inline void fillRGB565Span(uint16_t* framebuffer, int32_t bufferIndex, int32_t count, uint16_t color)
 {
     if (count <= 0) return;
+    color = jetWs565(color);  // single swap point covers every fill caller
 
     int32_t idx = bufferIndex;
     int32_t remaining = count;
@@ -1346,7 +1352,7 @@ namespace Renderer
                             count, color, alpha, false);
                     } else {
                         for (int i = 0; i < count; ++i)
-                            framebuffer[bufferIndex + i] = blendRGB565(framebuffer[bufferIndex + i], color, alpha);
+                            framebuffer[bufferIndex + i] = jetWs565(blendRGB565(jetWs565(framebuffer[bufferIndex + i]), color, alpha));
                     }
                 }
     #endif // SCREEN_DOOR_ALPHA
@@ -1890,9 +1896,9 @@ namespace Renderer
                 // per-pixel depth-fog fade. Skip the blend math when the
                 // material is fully opaque — common case.
                 if (pixAlpha == 255) {
-                    framebuffer[bufferIndex] = color;
+                    framebuffer[bufferIndex] = jetWs565(color);
                 } else {
-                    framebuffer[bufferIndex] = blendRGB565(framebuffer[bufferIndex], color, pixAlpha);
+                    framebuffer[bufferIndex] = jetWs565(blendRGB565(jetWs565(framebuffer[bufferIndex]), color, pixAlpha));
                 }
     #endif
     #endif

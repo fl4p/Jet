@@ -2,6 +2,7 @@
 #include "TrigLUT.hpp"
 #include "Renderer.hpp"
 #include "BlendSpans.hpp"
+#include "WireSwap565.hpp"
 #include "JetConfig.hpp"
 #include <cstring> // For memset
 #include <algorithm> // For std::min, std::max
@@ -387,8 +388,8 @@ void PERF_CRITICAL Scene::clearBuffers() {
                 #if DEBUG_OVERDRAW
                 const uint16_t lineColor = 0;
                 #else
-                const uint16_t lineColor = backgroundGradientColors
-                                           ? backgroundGradientColors[y] : backcolor;
+                const uint16_t lineColor = jetWs565(backgroundGradientColors
+                                           ? backgroundGradientColors[y] : backcolor);
                 #endif
                 uint16_t* row = framebuffer + y * screenWidth;
                 for (int x = 0; x < screenWidth; ++x) {
@@ -406,7 +407,7 @@ void PERF_CRITICAL Scene::clearBuffers() {
                 uint16_t lineColor = 0;
                 uint32_t lineColor32 = 0;
                 #else
-                uint16_t lineColor = backgroundGradientColors ? backgroundGradientColors[y] : backcolor;
+                uint16_t lineColor = jetWs565(backgroundGradientColors ? backgroundGradientColors[y] : backcolor);
                 uint32_t lineColor32 = (lineColor << 16) | lineColor;
                 #endif
                 #if HALF_WIDTH_BUFFERS
@@ -473,9 +474,9 @@ void PERF_CRITICAL Scene::clearBuffers() {
                 // is half-height (HALF_WIDTH_BUFFERS implies a y/2-style
                 // layout in some configs), index by `y` directly because
                 // rowCount already accounts for the halving.
-                const uint16_t lineColor = backgroundGradientColors
+                const uint16_t lineColor = jetWs565(backgroundGradientColors
                                            ? backgroundGradientColors[y * (screenHeight / rowCount)]
-                                           : backcolor;
+                                           : backcolor);
                 #endif
                 const uint32_t lineColor32 = ((uint32_t)lineColor << 16) | lineColor;
                 uint32_t* lineStart = framebuffer32 + y * row32;

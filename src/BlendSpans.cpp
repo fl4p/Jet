@@ -1,4 +1,5 @@
 #include "BlendSpans.hpp"
+#include "WireSwap565.hpp"
 #include "FastMath.hpp"
 #include <algorithm>
 
@@ -231,6 +232,20 @@ void RGB565ConstantBlend::prepare(uint16_t solidColor, uint8_t a, bool constantB
 void PERF_CRITICAL RGB565ConstantBlend::blend(uint16_t* dst, const uint16_t* src, int count) const {
     if (count <= 0) return;
     const uint16_t* input = background ? src : dst;
+#if JET_WIRE_SWAP
+    // Wire-order framebuffer: stay scalar, unswap on load, re-swap on store.
+    // Fog spans are a small minority of pixels, so skipping the EE path here
+    // is cheaper than vectorising the byte swap.
+    const unsigned sw0 = background ? alpha : 256u - alpha;
+    const unsigned cw0 = 256u - sw0;
+    for (int i = 0; i < count; ++i) {
+        const unsigned v = jetWs565(input[i]);
+        dst[i] = jetWs565((uint16_t)(((((v>>11)*sw0+((color>>11)&31)*cw0)>>8)<<11)
+            | (((((v>>5)&63)*sw0+((color>>5)&63)*cw0)>>8)<<5)
+            | (((v&31)*sw0+(color&31)*cw0)>>8)));
+    }
+    return;
+#endif
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
     const auto s = (uintptr_t)input, d = (uintptr_t)dst;
     // Equal alignment permits direct vector loads. Forward feedback and
