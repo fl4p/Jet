@@ -14,7 +14,10 @@
 #define JET_CULL_SLIVERS 1   // drop triangles thinner than half a pixel at emit time (see emitTri)
 #endif
 #if JET_CULL_SLIVERS
-namespace Renderer { float jetSliverMinThickness = 0.25f; }   // pixels (alpha < 64 is invisible on RGB565); 0 disables, host tools set it for A/B
+namespace Renderer {
+float   jetSliverMinThickness = 0.05f;   // pixels: thinner than this is dropped (degenerate / sign-flipped back faces)
+int32_t jetSliverPushZ = 80;             // world units a sub-pixel triangle is sorted farther back (~2 buckets of 40)
+}
 #endif
 
 namespace Renderer {
@@ -1581,30 +1584,41 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         if (shouldCull) return;
 #if JET_CULL_SLIVERS
         // Hairline triangles: a face seen almost edge-on projects to a long
-        // sliver a fraction of a pixel thick, and the inclusive span rule
-        // still paints at least one pixel per row of it, so a quarter-pixel
-        // crest facet became a solid line of single bright pixels across the
-        // slope behind it (measured 2026-09-13, esp-flightscene2: area 3.5
-        // px^2 over 31 px). Dropping them instead punched the same dotted
-        // line in the sky colour along ridge silhouettes. So: thinner than a
-        // pixel -> blend it with alpha = its thickness (coverage), thinner
-        // than jetSliverMinThickness -> drop. Thickness = 2*area/L for the
-        // longest edge L. Also removes back faces the integer shoelace
-        // flipped to "front" (their area is ~0).
-        uint8_t sliverAlpha = 255;
+        // sliver a fraction of a pixel thick; point sampling paints it at full
+        // intensity wherever an integer x falls inside, so a lit quarter-pixel
+        // crest facet drew a dotted bright line across the shadowed slope 18
+        // units behind it (2026-09-13, esp-flightscene2: area 3.5 px^2 over
+        // 31 px). Dropping such triangles punched the same dotted line in the
+        // sky colour along every ridge silhouette, and blending them by
+        // coverage did the same more faintly: at a silhouette the crest
+        // facet really owns those pixel centres. What works is DEPTH ORDER:
+        // a sub-pixel triangle is sorted jetSliverPushZ farther back, so any
+        // neighbouring face within that distance paints over it while a
+        // distant background behind a silhouette does not. Thickness =
+        // 2*area/L for the longest edge L; below jetSliverMinThickness the
+        // triangle is dropped (degenerate, or a back face the integer
+        // shoelace flipped). Cheap gate first: 2*area >= w+h >= L means
+        // thickness >= 1, which is nearly every triangle.
+        int32_t sliverPush = 0;
         {
-            const int64_t dx1 = b.position.x - a.position.x, dy1 = b.position.y - a.position.y;
-            const int64_t dx2 = c.position.x - b.position.x, dy2 = c.position.y - b.position.y;
-            const int64_t dx3 = a.position.x - c.position.x, dy3 = a.position.y - c.position.y;
-            int64_t l2 = dx1 * dx1 + dy1 * dy1;
-            const int64_t l2b = dx2 * dx2 + dy2 * dy2, l2c = dx3 * dx3 + dy3 * dy3;
-            if (l2b > l2) l2 = l2b;
-            if (l2c > l2) l2 = l2c;
+            int32_t minx = a.position.x, maxx = a.position.x, miny = a.position.y, maxy = a.position.y;
+            if (b.position.x < minx) minx = b.position.x; if (b.position.x > maxx) maxx = b.position.x;
+            if (c.position.x < minx) minx = c.position.x; if (c.position.x > maxx) maxx = c.position.x;
+            if (b.position.y < miny) miny = b.position.y; if (b.position.y > maxy) maxy = b.position.y;
+            if (c.position.y < miny) miny = c.position.y; if (c.position.y > maxy) maxy = c.position.y;
             const int64_t a2 = shoelaceArea < 0 ? -shoelaceArea : shoelaceArea;
-            if (a2 * a2 < l2) {                                   // thinner than one pixel
-                const float th = (float)a2 / sqrtf((float)l2);
-                if (th < jetSliverMinThickness) return;
-                sliverAlpha = (uint8_t)(th * 255.0f);
+            if (a2 < (int64_t)(maxx - minx) + (maxy - miny)) {
+                const int64_t dx1 = b.position.x - a.position.x, dy1 = b.position.y - a.position.y;
+                const int64_t dx2 = c.position.x - b.position.x, dy2 = c.position.y - b.position.y;
+                const int64_t dx3 = a.position.x - c.position.x, dy3 = a.position.y - c.position.y;
+                int64_t l2 = dx1 * dx1 + dy1 * dy1;
+                const int64_t l2b = dx2 * dx2 + dy2 * dy2, l2c = dx3 * dx3 + dy3 * dy3;
+                if (l2b > l2) l2 = l2b;
+                if (l2c > l2) l2 = l2c;
+                if (a2 * a2 < l2) {                                   // thinner than one pixel
+                    if ((float)a2 < jetSliverMinThickness * sqrtf((float)l2)) return;
+                    sliverPush = jetSliverPushZ;
+                }
             }
         }
 #endif
@@ -1634,9 +1648,6 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         rt.noWriteZBuffer = noWriteZBuffer;
         rt.zBias          = obj->zBias;
         rt.objAlpha       = objAlpha;
-#if JET_CULL_SLIVERS
-        if (sliverAlpha != 255) rt.objAlpha = (uint8_t)(((uint16_t)rt.objAlpha * sliverAlpha) / 255);
-#endif
         rt.avgZ           = avgZ;
         rt.brightnessPrecomputed = false;
 #if LIGHTING
@@ -1688,7 +1699,10 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
             if (!ignoreZBuffer) {
                 constexpr int32_t zBiasScale = 256;
                 constexpr int K = SortBucketCount - 2;
-                const int32_t key = avgZ - static_cast<int32_t>(obj->zBias) * zBiasScale;
+                int32_t key = avgZ - static_cast<int32_t>(obj->zBias) * zBiasScale;
+#if JET_CULL_SLIVERS
+                key += sliverPush;                                    // hairlines sort behind their neighbours
+#endif
                 const int32_t range = std::max<int32_t>(camera->farPlane - camera->nearPlane, 1);
                 // Exact old bucket formula; the 32-bit hardware divide when the
                 // product fits (always, for world-scale keys), int64 otherwise.
