@@ -237,14 +237,18 @@ Scene::~Scene() {
 }
 
 void Scene::reserveQueues(size_t n) {
-    renderQueue.reserve(n);
+    queueCap = (uint32_t)n;
+    renderQueue.resize(n);        // materialised once: the lanes write by index, nothing ever reallocates
     for (auto& v : bandOrder) v.reserve(n / 2);
-    renderBuckets.reserve(n);
-    renderYSpan.reserve(2 * n);
+    renderBuckets.resize(n);
+    renderYSpan.resize(2 * n);
     renderOrder.reserve(n);
 #if TEXTURE_MAPPING
     textureQueue.reserve(n);
 #endif
+    // lane 1 of a split prepareFrame emits about half the frame
+    lanes[1].transformedVertices.reserve(256);
+    lanes[0].transformedVertices.reserve(256);
 }
 
 void Scene::buildBandLists(int bandRows) {
@@ -549,6 +553,122 @@ void PERF_CRITICAL Scene::clearBuffers() {
     }
 }
 
+// The per-object part of prepareFrame for objects [first, last): cull, fade, LOD pick, transform and emit into lane L.
+// Reads the frame state prepareFrame set up (camera matrix, cull planes, prepCam) and writes only L and the objects.
+void Scene::prepareObjects(PrepareLane& L, size_t first, size_t last) {
+    const int32_t camCosX = prepCam[0], camSinX = prepCam[1], camCosY = prepCam[2], camSinY = prepCam[3], camCosZ = prepCam[4], camSinZ = prepCam[5];
+    for (size_t oi = first; oi < last; ++oi) {
+        Object* obj = objects[oi];
+        if (!obj->enabled) continue;
+        if (obj->triangles.empty() && obj->lodMeshes.empty()) continue;   // nothing to draw: skip the per-object setup
+        // 1) Quick sphere far-cull before the expensive 8-corner AABB test.
+        //    distSq to the object centre is computed unconditionally so it
+        //    is also available for the fade ramps and LOD pick below,
+        //    replacing the old lazy-compute block. The conservative sphere
+        //    radius used is the object's longest bounding-box dimension
+        //    (always >= the true bounding-sphere radius — never drops a
+        //    visible object).
+        uint8_t objAlpha = 255;
+        const int32_t _ocx = (obj->position.x + obj->centreVolume.x) - camera->position.x;
+        const int32_t _ocy = (obj->position.y + obj->centreVolume.y) - camera->position.y;
+        const int32_t _ocz = (obj->position.z + obj->centreVolume.z) - camera->position.z;
+        int64_t distSq = (int64_t)_ocx*_ocx + (int64_t)_ocy*_ocy + (int64_t)_ocz*_ocz;
+        int32_t dist   = -1;
+        {
+            const int32_t maxExtent = std::max({
+                obj->boundingBoxMax.x - obj->boundingBoxMin.x,
+                obj->boundingBoxMax.y - obj->boundingBoxMin.y,
+                obj->boundingBoxMax.z - obj->boundingBoxMin.z});
+            const int64_t farCutoff = static_cast<int64_t>(camera->farPlane) + maxExtent;
+            if (distSq > farCutoff * farCutoff) continue;
+        }
+        // 2) Object-level AABB frustum cull (all 8 corners; full rotation).
+        if (cullObject(obj, camCosX, camSinX, camCosY, camSinY, camCosZ, camSinZ))
+            continue;
+        // 3) Per-object distance fade (two ramps, multiplied):
+        //     - fadeFar > 0:   close=opaque, far=invisible (decor fade-out).
+        //     - appearFar > 0: close=invisible, far=opaque (LOD impostor
+        //                      that pops in at distance).
+        //     Both can be combined on the same object if you want a
+        //     visibility "band" — opaque only between two distances.
+        //     fadeFar==0 / appearFar==0 disable the respective ramp.
+        //     Distance is measured in world space from the camera to the
+        //     object's centre (position + centreVolume). Beyond fadeFar
+        //     OR closer than appearNear the object is skipped entirely
+        //     (no transform, no per-tri work), so this is a real perf
+        //     win not just a visual fade.
+        // distSq is always valid here (computed above for the sphere pre-cull).
+        if (obj->fadeFar > 0 || obj->appearFar > 0) {
+            if (obj->fadeFar > 0) {
+                const int64_t farSq = (int64_t)obj->fadeFar * obj->fadeFar;
+                if (distSq >= farSq) continue; // fully past fade-out — skip
+                const int64_t nearSq = (int64_t)obj->fadeNear * obj->fadeNear;
+                if (distSq > nearSq && obj->fadeFar > obj->fadeNear) {
+                    if (dist < 0) dist = (int32_t)sqrtf((float)distSq);
+                    const int32_t span = obj->fadeFar - obj->fadeNear;
+                    const int32_t over = dist - obj->fadeNear;
+                    int32_t a = 255 - (over * 255) / span;
+                    if (a < 0) a = 0;
+                    if (a > 255) a = 255;
+                    objAlpha = (uint8_t)((objAlpha * a) / 255);
+                }
+            }
+
+            // Appear-in ramp (LOD impostor).
+            if (obj->appearFar > 0) {
+                const int64_t nearSq = (int64_t)obj->appearNear * obj->appearNear;
+                if (distSq <= nearSq) continue; // still too close — skip
+                const int64_t farSq = (int64_t)obj->appearFar * obj->appearFar;
+                if (distSq < farSq && obj->appearFar > obj->appearNear) {
+                    if (dist < 0) dist = (int32_t)sqrtf((float)distSq);
+                    const int32_t span = obj->appearFar - obj->appearNear;
+                    const int32_t over = dist - obj->appearNear;
+                    int32_t a = (over * 255) / span;
+                    if (a < 0) a = 0;
+                    if (a > 255) a = 255;
+                    objAlpha = (uint8_t)((objAlpha * a) / 255);
+                }
+                // distSq >= farSq: fully appeared, multiplier already 255.
+            }
+
+            if (objAlpha == 0) continue;
+        }
+
+        // 1c) Global LOD pick. The head Object IS LOD 0; entries in
+        //     obj->lodMeshes are LOD 1, 2, ... in order. Beyond the last
+        //     available LOD: cull (default) or clamp (`lodPersist`).
+        //     The picked Object* contributes ONLY mesh data; the head's
+        //     transform / flags / AABB / fade ramps still drive the draw.
+        Object* meshSource = obj;
+        if (lodScale > 0) {
+            if (dist < 0 && distSq >= 0) dist = (int32_t)sqrtf((float)distSq);
+            int32_t level = (dist < 0 ? 0 : dist / lodScale);
+            level += (int32_t)lodBias + (int32_t)obj->lodBias;
+            if (level < 0) level = 0;
+
+            const int availableLODs = (int)obj->lodMeshes.size();
+            if (level == 0) {
+                meshSource = obj;
+            } else if (level <= availableLODs) {
+                Object* candidate = obj->lodMeshes[level - 1];
+                meshSource = candidate ? candidate : obj;
+            } else if (obj->lodPersist) {
+                if (availableLODs > 0) {
+                    Object* candidate = obj->lodMeshes[availableLODs - 1];
+                    meshSource = candidate ? candidate : obj;
+                }
+                // else: no LOD chain at all, draw the head as-is.
+            } else {
+                continue; // ran out of LODs and not persisting → cull.
+            }
+        }
+
+        // 2) Transform + project + per-triangle cull, push into renderQueue
+        renderObject(L, obj, camCosX, camSinX, camCosY, camSinY, camCosZ, camSinZ, objAlpha, meshSource);
+        ++L.drawnObjs;
+    }
+}
+
 void Scene::prepareFrame() {
     if (!camera) return;
 #if JET_PROFILE
@@ -668,127 +788,116 @@ void Scene::prepareFrame() {
     renderer->waterlineY = screenHeight / 2
                          + (int)(camSinX * camera->fovFactor / 1024.0f);
 
-    renderQueue.clear();
-    renderBuckets.clear();
-    renderYSpan.clear();
     bandListRows = 0;
 
 #if TEXTURE_MAPPING
     textureQueue.clear();
 #endif
-    int drawnObjs = 0;
-
-    for (auto obj : objects) {
-        if (!obj->enabled) continue;
-        if (obj->triangles.empty() && obj->lodMeshes.empty()) continue;   // nothing to draw: skip the per-object setup
-        // 1) Quick sphere far-cull before the expensive 8-corner AABB test.
-        //    distSq to the object centre is computed unconditionally so it
-        //    is also available for the fade ramps and LOD pick below,
-        //    replacing the old lazy-compute block. The conservative sphere
-        //    radius used is the object's longest bounding-box dimension
-        //    (always >= the true bounding-sphere radius — never drops a
-        //    visible object).
-        uint8_t objAlpha = 255;
-        const int32_t _ocx = (obj->position.x + obj->centreVolume.x) - camera->position.x;
-        const int32_t _ocy = (obj->position.y + obj->centreVolume.y) - camera->position.y;
-        const int32_t _ocz = (obj->position.z + obj->centreVolume.z) - camera->position.z;
-        int64_t distSq = (int64_t)_ocx*_ocx + (int64_t)_ocy*_ocy + (int64_t)_ocz*_ocz;
-        int32_t dist   = -1;
-        {
-            const int32_t maxExtent = std::max({
-                obj->boundingBoxMax.x - obj->boundingBoxMin.x,
-                obj->boundingBoxMax.y - obj->boundingBoxMin.y,
-                obj->boundingBoxMax.z - obj->boundingBoxMin.z});
-            const int64_t farCutoff = static_cast<int64_t>(camera->farPlane) + maxExtent;
-            if (distSq > farCutoff * farCutoff) continue;
-        }
-        // 2) Object-level AABB frustum cull (all 8 corners; full rotation).
-        if (cullObject(obj, camCosX, camSinX, camCosY, camSinY, camCosZ, camSinZ))
-            continue;
-        // 3) Per-object distance fade (two ramps, multiplied):
-        //     - fadeFar > 0:   close=opaque, far=invisible (decor fade-out).
-        //     - appearFar > 0: close=invisible, far=opaque (LOD impostor
-        //                      that pops in at distance).
-        //     Both can be combined on the same object if you want a
-        //     visibility "band" — opaque only between two distances.
-        //     fadeFar==0 / appearFar==0 disable the respective ramp.
-        //     Distance is measured in world space from the camera to the
-        //     object's centre (position + centreVolume). Beyond fadeFar
-        //     OR closer than appearNear the object is skipped entirely
-        //     (no transform, no per-tri work), so this is a real perf
-        //     win not just a visual fade.
-        // distSq is always valid here (computed above for the sphere pre-cull).
-        if (obj->fadeFar > 0 || obj->appearFar > 0) {
-            if (obj->fadeFar > 0) {
-                const int64_t farSq = (int64_t)obj->fadeFar * obj->fadeFar;
-                if (distSq >= farSq) continue; // fully past fade-out — skip
-                const int64_t nearSq = (int64_t)obj->fadeNear * obj->fadeNear;
-                if (distSq > nearSq && obj->fadeFar > obj->fadeNear) {
-                    if (dist < 0) dist = (int32_t)sqrtf((float)distSq);
-                    const int32_t span = obj->fadeFar - obj->fadeNear;
-                    const int32_t over = dist - obj->fadeNear;
-                    int32_t a = 255 - (over * 255) / span;
-                    if (a < 0) a = 0;
-                    if (a > 255) a = 255;
-                    objAlpha = (uint8_t)((objAlpha * a) / 255);
+    // lanes: two disjoint regions of ONE queue, so nothing is copied after the join and lane 1's triangles stay in internal RAM
+    uint32_t cap = queueCap;
+    auto setup_lanes = [&](uint32_t base1) {
+        lane1Begin = base1;
+        lanes[0].q.reset(renderQueue.data(), base1);
+        lanes[0].bkt.reset(renderBuckets.data(), base1);
+        lanes[0].ysp.reset(renderYSpan.data(), 2 * base1);
+        lanes[1].q.reset(renderQueue.data() + base1, cap - base1);
+        lanes[1].bkt.reset(renderBuckets.data() + base1, cap - base1);
+        lanes[1].ysp.reset(renderYSpan.data() + 2 * base1, 2 * (cap - base1));
+    };
+#if TEXTURE_MAPPING
+    lanes[0].textureQueue = &textureQueue; lanes[1].textureQueue = &lane1Texture; lane1Texture.clear();
+#endif
+    for (PrepareLane& L : lanes) { L.drawnObjs = 0; for (int q = 0; q < 32; ++q) { L.prof_cnt[q] = 0; L.prof_cyc[q] = 0; } }
+    prepCam[0] = camCosX; prepCam[1] = camSinX; prepCam[2] = camCosY; prepCam[3] = camSinY; prepCam[4] = camCosZ; prepCam[5] = camSinZ;
+    const size_t nObjs = objects.size();
+    lastPrepareSplit = 0;
+    if (prepareExecutor.start && prepareExecutor.join && nObjs > 1) {
+        // split point: half of the enabled objects' vertex count (a cost proxy; the order of the lanes is the serial order)
+        uint64_t total = 0;
+        for (const Object* o : objects) if (o->enabled) total += o->vertices.size() + o->triangles.size();
+        uint64_t acc = 0; size_t k = 0;
+        const uint64_t target = (uint64_t)((double)total * (double)prepareSplitFrac);
+        for (; k < nObjs; ++k) { const Object* o = objects[k]; if (o->enabled) acc += o->vertices.size() + o->triangles.size(); if (acc >= target) { ++k; break; } }
+        if (k > 0 && k < nObjs) {
+            lane1First = k; lane1Last = nObjs; lastPrepareSplit = k;
+            // Region sizes come from each lane's recent HIGH-WATER emit count plus 20 %, not from a mean: balancing the lanes by TIME
+            // makes the emitted counts lopsided (device: 75 vs 300 in one frame), and a mean-sized region overflowed 8.7 % of frames.
+            // Any slack left in the buffer is split evenly, so both lanes keep headroom for a heavier frame.
+            {
+                uint32_t need0 = laneHigh[0] + laneHigh[0] / 3 + 16;
+                uint32_t need1 = laneHigh[1] + laneHigh[1] / 3 + 16;
+                if (need0 + need1 > cap) {   // shrink both proportionally; an overflow then redoes the frame serially
+                    const uint64_t sum = (uint64_t)need0 + need1;
+                    need0 = (uint32_t)((uint64_t)need0 * cap / sum);
+                    need1 = cap - need0;
+                }
+                setup_lanes(need0 + (cap - need0 - need1) / 2);
+            }
+            const auto now = prepareExecutor.now; void* const nu = prepareExecutor.user;
+            PrepareTimes& pt = lastPrepareTimes;
+            pt.cost0 = acc; pt.cost1 = total - acc;
+            const int64_t tp0 = now ? now(nu) : 0;
+            // lane 1 writes only pt.lane1 (its own field); the caller reads it after join
+            prepareExecutor.start(prepareExecutor.user, [](void* self) {
+                Scene* sc = static_cast<Scene*>(self); const auto nw = sc->prepareExecutor.now; void* const u = sc->prepareExecutor.user;
+                const int64_t a = nw ? nw(u) : 0;
+                sc->prepareObjects(sc->lanes[1], sc->lane1First, sc->lane1Last);
+                sc->lastPrepareTimes.lane1 = nw ? nw(u) - a : 0; }, this);
+            prepareObjects(lanes[0], 0, k);
+            const int64_t tp1 = now ? now(nu) : 0;
+            prepareExecutor.join(prepareExecutor.user);
+            const int64_t tp2 = now ? now(nu) : 0;
+            pt.tris0 = lanes[0].q.size(); pt.tris1 = lanes[1].q.size();
+#if TEXTURE_MAPPING
+#error "TEXTURE_MAPPING with split prepare needs the uv queue split the same way (it is 0 in this project)"
+#endif
+            if (now) {
+                pt.lane0 = tp1 - tp0; pt.join = tp2 - tp1; pt.merge = now(nu) - tp2;
+                // nudge the split toward equal lane times (10 % of the imbalance per frame, clamped): the cost proxy does not
+                // track the emit cost, and the device showed lane 1 taking 0.26..0.71 of the emitted triangles at a fixed 0.49 of the proxy
+                const double l0 = (double)pt.lane0, l1 = (double)pt.lane1;
+                if (l0 > 0 && l1 > 0) {
+                    prepareSplitFrac += (float)(0.1 * (l1 - l0) / (l0 + l1)) * prepareSplitFrac;
+                    if (prepareSplitFrac < 0.2f) prepareSplitFrac = 0.2f;
+                    if (prepareSplitFrac > 0.8f) prepareSplitFrac = 0.8f;
                 }
             }
-
-            // Appear-in ramp (LOD impostor).
-            if (obj->appearFar > 0) {
-                const int64_t nearSq = (int64_t)obj->appearNear * obj->appearNear;
-                if (distSq <= nearSq) continue; // still too close — skip
-                const int64_t farSq = (int64_t)obj->appearFar * obj->appearFar;
-                if (distSq < farSq && obj->appearFar > obj->appearNear) {
-                    if (dist < 0) dist = (int32_t)sqrtf((float)distSq);
-                    const int32_t span = obj->appearFar - obj->appearNear;
-                    const int32_t over = dist - obj->appearNear;
-                    int32_t a = (over * 255) / span;
-                    if (a < 0) a = 0;
-                    if (a > 255) a = 255;
-                    objAlpha = (uint8_t)((objAlpha * a) / 255);
-                }
-                // distSq >= farSq: fully appeared, multiplier already 255.
-            }
-
-            if (objAlpha == 0) continue;
-        }
-
-        // 1c) Global LOD pick. The head Object IS LOD 0; entries in
-        //     obj->lodMeshes are LOD 1, 2, ... in order. Beyond the last
-        //     available LOD: cull (default) or clamp (`lodPersist`).
-        //     The picked Object* contributes ONLY mesh data; the head's
-        //     transform / flags / AABB / fade ramps still drive the draw.
-        Object* meshSource = obj;
-        if (lodScale > 0) {
-            if (dist < 0 && distSq >= 0) dist = (int32_t)sqrtf((float)distSq);
-            int32_t level = (dist < 0 ? 0 : dist / lodScale);
-            level += (int32_t)lodBias + (int32_t)obj->lodBias;
-            if (level < 0) level = 0;
-
-            const int availableLODs = (int)obj->lodMeshes.size();
-            if (level == 0) {
-                meshSource = obj;
-            } else if (level <= availableLODs) {
-                Object* candidate = obj->lodMeshes[level - 1];
-                meshSource = candidate ? candidate : obj;
-            } else if (obj->lodPersist) {
-                if (availableLODs > 0) {
-                    Object* candidate = obj->lodMeshes[availableLODs - 1];
-                    meshSource = candidate ? candidate : obj;
-                }
-                // else: no LOD chain at all, draw the head as-is.
-            } else {
-                continue; // ran out of LODs and not persisting → cull.
-            }
-        }
-
-        // 2) Transform + project + per-triangle cull, push into renderQueue
-        renderObject(obj, camCosX, camSinX, camCosY, camSinY, camCosZ, camSinZ, objAlpha, meshSource);
-        ++drawnObjs;
+        } else { setup_lanes(cap); prepareObjects(lanes[0], 0, nObjs); }
+    } else {
+        setup_lanes(cap);
+        prepareObjects(lanes[0], 0, nObjs);
     }
+    lane0Count = lanes[0].q.size(); lane1Count = lanes[1].q.size();
+    // decaying high-water: rises at once for a heavier frame, falls slowly so a single light frame cannot shrink a region
+    laneHigh[0] = std::max(lane0Count, laneHigh[0] - laneHigh[0] / 256);
+    laneHigh[1] = std::max(lane1Count, laneHigh[1] - laneHigh[1] / 256);
+    if (lanes[0].q.over || lanes[1].q.over || lanes[0].bkt.over || lanes[1].bkt.over) {
+        // a region filled up: redo the whole frame serially over the entire buffer rather than lose triangles
+        ++prepareOverflows;
+        // the overflowing lane's count was clamped at its region, so the high-water cannot learn the real need from it: raise it here
+        if (lanes[0].q.over || lanes[0].bkt.over) laneHigh[0] += laneHigh[0] / 4 + 16;
+        if (lanes[1].q.over || lanes[1].bkt.over) laneHigh[1] += laneHigh[1] / 4 + 16;
+        // A region filled up. Redo the frame serially over the whole buffer; if that overflows too the buffer itself is too small,
+        // so grow it (counted and reported - a grown buffer can land in PSRAM, which costs 7-8 fps) and redo once more.
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            for (PrepareLane& L : lanes) { L.drawnObjs = 0; for (int q = 0; q < 32; ++q) { L.prof_cnt[q] = 0; L.prof_cyc[q] = 0; } }
+            setup_lanes(cap);
+            prepareObjects(lanes[0], 0, nObjs);
+            if (!lanes[0].q.over && !lanes[0].bkt.over) break;
+            ++queueGrowths;
+            queueCap = queueCap + queueCap / 2;
+            renderQueue.resize(queueCap); renderBuckets.resize(queueCap); renderYSpan.resize(2 * queueCap);
+            renderOrder.reserve(queueCap);
+            cap = queueCap;
+        }
+        lane0Count = lanes[0].q.size(); lane1Count = 0;
+    }
+    const int drawnObjs = lanes[0].drawnObjs + lanes[1].drawnObjs;
+#if JET_PROFILE
+    for (const PrepareLane& L : lanes) for (int q = 0; q < JP_N && q < 32; ++q) { jet_prof_cnt[q] += L.prof_cnt[q]; jet_prof_cyc[q] += L.prof_cyc[q]; }
+#endif
     lastFrameDrawnObjects   = drawnObjs;
-    lastFrameDrawnTriangles = static_cast<int>(renderQueue.size());
+    lastFrameDrawnTriangles = static_cast<int>(lane0Count + lane1Count);
 
 #if JET_PROFILE
     { const uint32_t jp1 = jet_prof_now(); jet_prof_cyc[JP_XFORM] += jp1 - jp0; jp0 = jp1; }
@@ -817,22 +926,26 @@ void Scene::prepareFrame() {
     // push_back left them and rasterizeBand() draws via renderOrder. This
     // deletes what used to be a full second copy of the queue every frame.
     {
-        const int N = static_cast<int>(renderQueue.size());
+        const int N = static_cast<int>(lane0Count + lane1Count);
+        const int32_t r0b = 0, r0e = (int32_t)lane0Count;                       // lane 0's region
+        const int32_t r1b = (int32_t)lane1Begin, r1e = r1b + (int32_t)lane1Count; // lane 1's, after the gap
         renderOrder.resize(N);
         if (N > 1) {
             int counts[SortBucketCount] = {};
             // Keys were captured while emitting triangles, when their
             // depth and flags were already live. Both passes now stream
             // bytes instead of revisiting strided, often external-RAM data.
-            for (uint8_t bucket : renderBuckets) ++counts[bucket];
+            for (int32_t i = r0b; i < r0e; ++i) ++counts[renderBuckets[i]];
+            for (int32_t i = r1b; i < r1e; ++i) ++counts[renderBuckets[i]];
             int pos[SortBucketCount];
             pos[0] = 0;
             for (int i = 1; i < SortBucketCount; ++i)
                 pos[i] = pos[i - 1] + counts[i - 1];
-            for (int32_t i = 0; i < N; ++i)
-                renderOrder[pos[renderBuckets[i]]++] = i;
+            // lane 0 before lane 1 within a bucket: the serial emit order, so the painter's tie-break is unchanged
+            for (int32_t i = r0b; i < r0e; ++i) renderOrder[pos[renderBuckets[i]]++] = i;
+            for (int32_t i = r1b; i < r1e; ++i) renderOrder[pos[renderBuckets[i]]++] = i;
         } else if (N == 1) {
-            renderOrder[0] = 0;
+            renderOrder[0] = lane0Count ? 0 : (int32_t)lane1Begin;
         }
     }
 #if JET_PROFILE
@@ -848,8 +961,24 @@ void Scene::clearBand(int yMin, int yMax) {
 }
 
 void Scene::rasterizeBand(int yMin, int yMax, uint8_t* triangleFlags) {
+    const int rasterized = rasterizeBandImpl(yMin, yMax, triangleFlags, nullptr, bandKeyMin, bandKeyMax, true);
+    if (!triangleFlags) lastFrameRasterizedTriangles = rasterized;
+}
+
+// Thread-safe band entry (multi-core rendering): an explicit framebuffer base and depth gate instead of the
+// shared setFramebuffer/setBandDepthGate state, the triangle count returned instead of written to
+// lastFrameRasterizedTriangles, and no writes to the global JET_PROFILE counters. Reads only state that
+// prepareFrame/buildBandLists left behind, so two threads may run it on disjoint rows at the same time.
+int Scene::rasterizeBandInto(int yMin, int yMax, uint16_t* framebufferBase, int32_t keyMin, int32_t keyMax) {
+    return rasterizeBandImpl(yMin, yMax, nullptr, framebufferBase, keyMin, keyMax, false);
+}
+
+int Scene::rasterizeBandImpl(int yMin, int yMax, uint8_t* triangleFlags, uint16_t* framebufferBase,
+                             int32_t keyMin, int32_t keyMax, bool profile) {
 #if JET_PROFILE
-    const uint32_t jp0 = jet_prof_now();
+    const uint32_t jp0 = profile ? jet_prof_now() : 0;
+#else
+    (void)profile;
 #endif
     // Create a thread-local copy of the rasteriser so each band worker has
     // its own yBandMin/yBandMax. Only framebuffer/zbuffer ptrs are shared;
@@ -857,6 +986,7 @@ void Scene::rasterizeBand(int yMin, int yMax, uint8_t* triangleFlags) {
     Rasterizer bandRast = *renderer;
     bandRast.yBandMin = yMin;
     bandRast.yBandMax = yMax;
+    if (framebufferBase) bandRast.setFramebuffer(framebufferBase);
 
     // 4) Flush. Count triangles that actually entered the rasterizer
     // (drawTriangle returned true). Triangles dropped by per-tri checks
@@ -871,9 +1001,9 @@ void Scene::rasterizeBand(int yMin, int yMax, uint8_t* triangleFlags) {
     for (const int32_t idx : walk) {
         if (!useList && (renderYSpan[2 * idx + 1] < yMin || renderYSpan[2 * idx] >= yMax)) continue;
         const RenderTri& t = renderQueue[idx];
-        if (bandKeyMin != INT32_MIN || bandKeyMax != INT32_MAX) {   // setBandDepthGate: far / near split around an externally drawn layer
+        if (keyMin != INT32_MIN || keyMax != INT32_MAX) {   // setBandDepthGate: far / near split around an externally drawn layer
             const int32_t key = t.avgZ - static_cast<int32_t>(t.zBias) * 256;
-            if (key < bandKeyMin || key >= bandKeyMax) continue;
+            if (key < keyMin || key >= keyMax) continue;
         }
 #if JET_FLAT_KERNEL
         if (t.flatOpaque && !bandRast.wireframeMode && !bandRast.interlacedMode && !bandRast.checkerboardMode) {
@@ -896,9 +1026,11 @@ void Scene::rasterizeBand(int yMin, int yMax, uint8_t* triangleFlags) {
             const int rows = bandRast.drawFlatOpaque(x1, y1, x2, y2, x3, y3, minX, maxX, minY, maxY, t.flatColor);
             if (rows >= 0) {
 #if JET_PROFILE
+                if (profile) {
                 ++jet_prof_cnt[JP_TRI_SETUP];
                 jet_prof_cnt[JP_TRI_ROWS] += (uint32_t)rows;
                 jet_prof_cyc[JP_TRI_ROWS] += jet_prof_now() - jpk;
+                }
 #endif
                 ++rasterized;
                 if (triangleFlags) triangleFlags[idx] = 1;
@@ -931,10 +1063,10 @@ void Scene::rasterizeBand(int yMin, int yMax, uint8_t* triangleFlags) {
             if (triangleFlags) triangleFlags[idx] = 1;
         }
     }
-    if (!triangleFlags) lastFrameRasterizedTriangles = rasterized;
 #if JET_PROFILE
-    jet_prof_cyc[JP_BAND_WALK] += jet_prof_now() - jp0; ++jet_prof_cnt[JP_BAND_WALK];
+    if (profile) { jet_prof_cyc[JP_BAND_WALK] += jet_prof_now() - jp0; ++jet_prof_cnt[JP_BAND_WALK]; }
 #endif
+    return rasterized;
 }
 
 void Scene::render(RasterExecutor executor) {
@@ -1098,7 +1230,7 @@ void Scene::getStatistics(int& objectCount, int& triangleCount, int& vertexCount
     }
 }
 
-void PERF_CRITICAL Scene::renderObject(Object* obj,
+void PERF_CRITICAL Scene::renderObject(PrepareLane& L, Object* obj,
                                      int32_t camCosX, int32_t camSinX,
                                      int32_t camCosY, int32_t camSinY,
                                      int32_t camCosZ, int32_t camSinZ,
@@ -1119,7 +1251,13 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
     // (one render task), so plain static is fine here. PipelineVertex keeps
     // only transformed attributes; mesh UVs are fetched for visible textured
     // faces below. The loop writes every live field, with no upfront copy.
-    static std::vector<PipelineVertex> transformedVertices;
+    std::vector<PipelineVertex>& transformedVertices = L.transformedVertices;   // per lane (was a function static: one render task only)
+    LaneArena<RenderTri>& renderQueue = L.q;
+    LaneArena<uint8_t>& renderBuckets = L.bkt;
+    LaneArena<int16_t>& renderYSpan = L.ysp;
+#if TEXTURE_MAPPING
+    std::vector<TriangleUV>& textureQueue = *L.textureQueue;
+#endif
     const size_t vertCount = meshSource->vertices.size();
     transformedVertices.resize(vertCount);
 
@@ -1375,9 +1513,9 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
     // Transform vertices and normals, writing only live projected attributes.
     const Vector3* packedPositions = meshSource->cachedPositions();
 #if JET_PROFILE
-    jet_prof_cnt[JP_XFORM] += (uint32_t)vertCount;
+    L.prof_cnt[JP_XFORM] += (uint32_t)vertCount;
     const uint32_t jpv0 = jet_prof_now();
-    jet_prof_cyc[JP_OBJ] += jpv0 - jpo0;
+    L.prof_cyc[JP_OBJ] += jpv0 - jpo0;
 #endif
     for (size_t vi = 0; vi < vertCount; ++vi) {
         const Object::Vertex& srcVert = meshSource->vertices[vi];
@@ -1437,7 +1575,7 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
     }
 
 #if JET_PROFILE
-    jet_prof_cyc[JP_VERTS] += jet_prof_now() - jpv0;
+    L.prof_cyc[JP_VERTS] += jet_prof_now() - jpv0;
 #endif
 #if SORT_TRIANGLES
     // Sort the triangles by depth. Only intra-bucket order of the global
@@ -1560,7 +1698,7 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         // subsumes the depth-fog alpha=0 early-out that drawTriangle
         // would have done after a full setup.
 #if JET_PROFILE
-        struct JpEmitScope { uint32_t t0; ~JpEmitScope() { jet_prof_cyc[JP_EMIT] += jet_prof_now() - t0; ++jet_prof_cnt[JP_EMIT]; } } jpe{jet_prof_now()};
+        struct JpEmitScope { uint32_t t0; uint32_t* cyc; uint32_t* cnt; ~JpEmitScope() { cyc[JP_EMIT] += jet_prof_now() - t0; ++cnt[JP_EMIT]; } } jpe{jet_prof_now(), L.prof_cyc, L.prof_cnt};
 #endif
         const int32_t avgZ = (a.position.z + b.position.z + c.position.z) / 3;
         if (avgZ > camera->farPlane || avgZ < camera->nearPlane) return;
@@ -1632,11 +1770,10 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         }
 #endif
 #if JET_PROFILE
-        const uint32_t jpe1 = jet_prof_now(); jet_prof_cyc[JP_EMIT_CULL] += jpe1 - jpe.t0;
+        const uint32_t jpe1 = jet_prof_now(); L.prof_cyc[JP_EMIT_CULL] += jpe1 - jpe.t0;
 #endif
 
-        renderQueue.emplace_back();
-        RenderTri& rt = renderQueue.back();          // built in place: no 80-byte stack copy
+        RenderTri& rt = renderQueue.emplace_back();   // built in place in this lane's region; overflow returns a sink and is counted
         const bool reverse = cullingMode == CullingMode::NO_CULLING && shoelaceArea < 0;
         if (reverse) {
             rt.v1.assign(c); rt.v2.assign(b); rt.v3.assign(a);
@@ -1698,7 +1835,7 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         }
 #endif
 #if JET_PROFILE
-        const uint32_t jpe2 = jet_prof_now(); jet_prof_cyc[JP_EMIT_BUILD] += jpe2 - jpe1; ++jet_prof_cnt[JP_EMIT_BUILD];
+        const uint32_t jpe2 = jet_prof_now(); L.prof_cyc[JP_EMIT_BUILD] += jpe2 - jpe1; ++L.prof_cnt[JP_EMIT_BUILD];
 #endif
         // Preserve the old stable 64-bucket ordering exactly, including
         // noWriteZBuffer taking precedence when both special flags are set.
@@ -1732,7 +1869,7 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
             renderYSpan.push_back((int16_t)std::max<int32_t>(-32768, std::min<int32_t>(32767, yhi)));
         }
 #if JET_PROFILE
-        jet_prof_cyc[JP_EMIT_TAIL] += jet_prof_now() - jpe2;
+        L.prof_cyc[JP_EMIT_TAIL] += jet_prof_now() - jpe2;
 #endif
     };
 

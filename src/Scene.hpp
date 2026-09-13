@@ -106,6 +106,34 @@ public:
     ///        Lets a caller split one prepared frame into a far pass, something drawn
     ///        by other means (a column-rendered terrain), and a near pass. Default: all.
     void setBandDepthGate(int32_t keyMin, int32_t keyMax) { bandKeyMin = keyMin; bandKeyMax = keyMax; }
+    /// @brief Multi-core prepareFrame: `start` runs fn(arg) on another core and returns at once, `join` blocks until it has
+    /// returned. With both set, prepareFrame splits the enabled objects into two ranges by vertex count (serial order kept).
+    struct PrepareExecutor { void (*start)(void* user, void (*fn)(void*), void* arg) = nullptr; void (*join)(void* user) = nullptr; void* user = nullptr;
+                             int64_t (*now)(void* user) = nullptr; };   // optional µs clock: fills lastPrepareTimes (diagnostics only)
+    /// @brief Last split prepareFrame, µs: lane 0 on the calling core, lane 1 on the executor (timed there), the caller's join wait,
+    /// the lane-1 append; cost = the enabled vertices + triangles each lane was given (the split proxy), tris = triangles each lane emitted.
+    struct PrepareTimes { int64_t lane0 = 0, lane1 = 0, join = 0, merge = 0; uint64_t cost0 = 0, cost1 = 0; uint32_t tris0 = 0, tris1 = 0; };
+    PrepareTimes lastPrepareTimes;
+    /// @brief Lane-0 share of the split cost proxy. Starts at 0.5 and, when PrepareExecutor::now is set, is nudged each frame
+    /// toward equal lane times (the proxy misses the per-object emit cost). The split point never changes what is emitted, only
+    /// which lane emits it, so frames stay identical.
+    float prepareSplitFrac = 0.5f;
+    /// @brief Where the queues actually are right now: a vector that outgrows its reserve reallocates, and on the S3 a big
+    /// reallocation lands in PSRAM, which the boot-time address cannot show.
+    const void* queueData() const { return renderQueue.data(); }
+    size_t queueCapacity() const { return renderQueue.capacity(); }
+    const void* lane1QueueData() const { return renderQueue.data() + lane1Begin; }
+    size_t lane1QueueCapacity() const { return queueCap - lane1Begin; }
+    uint32_t lane1RegionBegin() const { return lane1Begin; }
+    uint32_t queueCapTriangles() const { return queueCap; }
+    uint32_t prepareOverflowCount() const { return prepareOverflows; }   // frames redone serially (a lane region filled up)
+    uint32_t queueGrowthCount() const { return queueGrowths; }           // buffer reallocations: must stay 0 on the S3 (PSRAM)
+    void setPrepareExecutor(const PrepareExecutor& e) { prepareExecutor = e; }
+    PrepareExecutor prepareExecutor;
+    size_t lastPrepareSplit = 0;   // objects index where lane 1 started (0 = serial), for diagnostics
+    /// @brief Thread-safe rasterizeBand for multi-core rendering: explicit framebuffer base (row 0 = engine row 0,
+    /// like setFramebuffer) and depth gate, returns the rasterized-triangle count, touches no shared state.
+    int rasterizeBandInto(int yMin, int yMax, uint16_t* framebufferBase, int32_t keyMin = INT32_MIN, int32_t keyMax = INT32_MAX);
 
     /// @brief Clear only the rows [yMin, yMax) of the current framebuffer without
     ///        re-running the transform or sort pipeline. Use this for bands 1+ when the
@@ -145,6 +173,8 @@ public:
     void buildBandLists(int bandRows);
     /// @brief Storage address of the render queue (placement diagnostics).
     const void* queueStorage() const { return renderQueue.data(); }
+    /// @brief Storage address of the lane-1 render queue (multi-core prepareFrame placement diagnostics).
+    const void* lane1QueueStorage() const { return renderQueue.data() + lane1Begin; }
 
     /// @brief Enable or disable per-frame framebuffer clearing.
     /// @param clear True to clear before rendering, false to preserve previous content.
@@ -293,6 +323,43 @@ private:
     // at emit time so rasterizeBand() can reject out-of-band triangles without
     // touching the (possibly external-RAM) RenderTri itself.
     std::vector<int16_t> renderYSpan;
+    // Multi-core prepareFrame: objects [0, k) emit into lane 0 (the members above), objects [k, N) into lane 1 on
+    // another core; lane 1 is appended to lane 0 afterwards, so insertion order (the painter's tie order) is exactly
+    // the serial order. Each lane has its own transform scratch and profile counters.
+    /// @brief One lane's slice of a shared queue: fixed storage, its own cursor, never reallocates (a reallocation on the S3
+    /// lands in PSRAM, which costs 7-8 fps). Overflow is counted, never a silently dropped triangle: prepareFrame redoes the
+    /// frame serially over the whole buffer when it happens.
+    template <class T>
+    struct LaneArena {
+        T* p = nullptr; uint32_t n = 0, cap = 0, over = 0; T sink{};
+        void reset(T* base, uint32_t capacity) { p = base; n = 0; cap = capacity; over = 0; }
+        T& emplace_back() { if (n < cap) return p[n++]; ++over; return sink; }
+        void push_back(const T& v) { if (n < cap) p[n++] = v; else ++over; }
+        uint32_t size() const { return n; }
+    };
+    struct PrepareLane {
+        LaneArena<RenderTri> q;
+        LaneArena<uint8_t> bkt;
+        LaneArena<int16_t> ysp;
+#if TEXTURE_MAPPING
+        std::vector<TriangleUV>* textureQueue = nullptr;
+#endif
+        std::vector<PipelineVertex> transformedVertices;
+        uint32_t prof_cnt[32] = {}, prof_cyc[32] = {};   // JET_PROFILE counters of this lane, added to the globals after the merge
+        int drawnObjs = 0;
+    };
+    PrepareLane lanes[2];
+    uint32_t queueCap = 0;        // triangles the single queue holds; lane 0 fills [0, lane1Begin), lane 1 [lane1Begin, queueCap)
+    uint32_t lane0Count = 0, lane1Begin = 0, lane1Count = 0;
+    uint32_t prepareOverflows = 0;   // frames redone serially because a lane region filled up
+    uint32_t queueGrowths = 0;       // times the buffer itself was too small and had to grow (must stay 0: a grown buffer can land in PSRAM)
+    uint32_t laneHigh[2] = {0, 0};   // decaying high-water of each lane's emitted triangles; the regions are sized from these, not from a mean
+#if TEXTURE_MAPPING
+    std::vector<TriangleUV> lane1Texture;
+#endif
+    int32_t prepCam[6] = {};   // camera cos/sin of the frame, for lane 1
+    size_t lane1First = 0, lane1Last = 0;
+    void prepareObjects(PrepareLane& L, size_t first, size_t last);
     // Painter's-sort output as indices into renderQueue, rebuilt by
     // prepareFrame() each frame. Sorting (scattering) 4-byte indices
     // instead of whole RenderTri structs avoids a full second copy of the
@@ -337,7 +404,8 @@ private:
                     int32_t camCosY, int32_t camSinY,
                     int32_t camCosZ, int32_t camSinZ) const;
 
-    void renderObject(Object* obj,
+    int rasterizeBandImpl(int yMin, int yMax, uint8_t* triangleFlags, uint16_t* framebufferBase, int32_t keyMin, int32_t keyMax, bool profile);
+    void renderObject(PrepareLane& L, Object* obj,
                       int32_t camCosX, int32_t camSinX,
                       int32_t camCosY, int32_t camSinY,
                       int32_t camCosZ, int32_t camSinZ,
