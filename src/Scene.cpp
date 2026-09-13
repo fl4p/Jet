@@ -871,6 +871,10 @@ void Scene::rasterizeBand(int yMin, int yMax, uint8_t* triangleFlags) {
     for (const int32_t idx : walk) {
         if (!useList && (renderYSpan[2 * idx + 1] < yMin || renderYSpan[2 * idx] >= yMax)) continue;
         const RenderTri& t = renderQueue[idx];
+        if (bandKeyMin != INT32_MIN || bandKeyMax != INT32_MAX) {   // setBandDepthGate: far / near split around an externally drawn layer
+            const int32_t key = t.avgZ - static_cast<int32_t>(t.zBias) * 256;
+            if (key < bandKeyMin || key >= bandKeyMax) continue;
+        }
 #if JET_FLAT_KERNEL
         if (t.flatOpaque && !bandRast.wireframeMode && !bandRast.interlacedMode && !bandRast.checkerboardMode) {
             // drawTriangleImpl's bounding box (even-aligned) and clamps, verbatim

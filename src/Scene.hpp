@@ -101,6 +101,11 @@ public:
     // bytes each), then OR them after joining to count unique triangles.
     // With flags supplied this does not write shared frame statistics.
     void rasterizeBand(int yMin, int yMax, uint8_t* triangleFlags = nullptr);
+    /// @brief Depth gate for rasterizeBand(): only queued triangles whose painter's
+    ///        key (avgZ - zBias * 256, camera-space units) lies in [min, max) are drawn.
+    ///        Lets a caller split one prepared frame into a far pass, something drawn
+    ///        by other means (a column-rendered terrain), and a near pass. Default: all.
+    void setBandDepthGate(int32_t keyMin, int32_t keyMax) { bandKeyMin = keyMin; bandKeyMax = keyMax; }
 
     /// @brief Clear only the rows [yMin, yMax) of the current framebuffer without
     ///        re-running the transform or sort pipeline. Use this for bands 1+ when the
@@ -278,6 +283,7 @@ private:
         int32_t sourceTriangleIndex;
 #endif
     };
+    int32_t bandKeyMin = INT32_MIN, bandKeyMax = INT32_MAX;   // setBandDepthGate
     std::vector<RenderTri> renderQueue;
     // One byte per triangle: background, 64 far-to-near depth buckets,
     // then overlay. Sorting never needs to fetch the full triangle payload.
