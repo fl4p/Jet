@@ -16,6 +16,7 @@
 #if JET_CULL_SLIVERS
 namespace Renderer {
 float   jetSliverMinThickness = 0.05f;   // pixels: thinner than this is dropped (degenerate / sign-flipped back faces)
+float   jetSliverPushMaxThickness = 0.5f; // pixels: thinner than this is sorted behind its neighbours (see emitTri)
 int32_t jetSliverPushZ = 80;             // world units a sub-pixel triangle is sorted farther back (~2 buckets of 40)
 }
 #endif
@@ -1594,11 +1595,15 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         // facet really owns those pixel centres. What works is DEPTH ORDER:
         // a sub-pixel triangle is sorted jetSliverPushZ farther back, so any
         // neighbouring face within that distance paints over it while a
-        // distant background behind a silhouette does not. Thickness =
-        // 2*area/L for the longest edge L; below jetSliverMinThickness the
-        // triangle is dropped (degenerate, or a back face the integer
-        // shoelace flipped). Cheap gate first: 2*area >= w+h >= L means
-        // thickness >= 1, which is nearly every triangle.
+        // distant background behind a silhouette does not. Only below
+        // jetSliverPushMaxThickness (0.5 px): a 0.5-1 px crest facet paints a
+        // nearly continuous one-pixel line, which is what a lit crest looks
+        // like; pushing it behind a slope that covers only some of its pixels
+        // turned that line into dots. Thickness = 2*area/L for the longest
+        // edge L; below jetSliverMinThickness the triangle is dropped
+        // (degenerate, or a back face the integer shoelace flipped). Cheap
+        // gate first: 2*area >= w+h >= L means thickness >= 1, which is
+        // nearly every triangle.
         int32_t sliverPush = 0;
         {
             const int32_t minx = std::min({a.position.x, b.position.x, c.position.x});
@@ -1615,8 +1620,9 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
                 if (l2b > l2) l2 = l2b;
                 if (l2c > l2) l2 = l2c;
                 if (a2 * a2 < l2) {                                   // thinner than one pixel
-                    if ((float)a2 < jetSliverMinThickness * sqrtf((float)l2)) return;
-                    sliverPush = jetSliverPushZ;
+                    const float th = (float)a2 / sqrtf((float)l2);
+                    if (th < jetSliverMinThickness) return;
+                    if (th < jetSliverPushMaxThickness) sliverPush = jetSliverPushZ;
                 }
             }
         }

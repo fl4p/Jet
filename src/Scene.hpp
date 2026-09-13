@@ -19,6 +19,7 @@ namespace Renderer {
 /// exposes a single `render()` entry point that runs the full
 /// transform/cull/raster/post-FX pipeline.
 extern float   jetSliverMinThickness;   // JET_CULL_SLIVERS: drop triangles thinner than this many pixels (Scene.cpp)
+extern float   jetSliverPushMaxThickness; // JET_CULL_SLIVERS: only triangles thinner than this (px) are pushed back
 extern int32_t jetSliverPushZ;          // JET_CULL_SLIVERS: sort sub-pixel triangles this many units farther back
 
 class Scene {
