@@ -1455,10 +1455,11 @@ namespace Renderer
                 // per-pixel state. The scanline walker already bounded x, so
                 // the general loop's per-pixel edge tests, stipple lookups and
                 // narrow stores are pure overhead here — fill the span wide.
-                // alpha>240 also implies the screen-door stipple draws every
-                // pixel, and depth fog (FAST_Z) folds into alpha per-triangle,
-                // so fogged triangles correctly fall through to the blend loop.
-                if ((emissive || flatColorPrecomputed) && alpha > 240 &&
+                // alpha must be exactly 255: with DEPTH_ALPHA_BLEND (no
+                // stipple) a 241-254 span has to BLEND, not replace. Depth fog
+                // (FAST_Z) folds into alpha per-triangle, so fogged triangles
+                // correctly fall through to the blend loop.
+                if ((emissive || flatColorPrecomputed) && alpha == 255 &&
                     !isWaterReflect && !isAdditive)
                 {
                     fillRGB565Span(framebuffer, bufferIndex, xEnd - xStart + 1, color);
