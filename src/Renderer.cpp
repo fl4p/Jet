@@ -1449,6 +1449,22 @@ namespace Renderer
     #else
                 int32_t bufferIndex = y * screenWidth + xStart;
     #endif
+    #if LIGHTING && !HALF_WIDTH_BUFFERS && !Z_BUFFERING && !DEBUG_OVERDRAW && !POSTFX_CELLSHADING && !Z_BRIGHTNESS && !TEXTURE_MAPPING && MAX_PICK_QUERIES == 0
+                // Constant-color fast span: FLAT triangles (color hoisted at
+                // setup) and UNLIT/emissive ones write one final color with no
+                // per-pixel state. The scanline walker already bounded x, so
+                // the general loop's per-pixel edge tests, stipple lookups and
+                // narrow stores are pure overhead here — fill the span wide.
+                // alpha>240 also implies the screen-door stipple draws every
+                // pixel, and depth fog (FAST_Z) folds into alpha per-triangle,
+                // so fogged triangles correctly fall through to the blend loop.
+                if ((emissive || flatColorPrecomputed) && alpha > 240 &&
+                    !isWaterReflect && !isAdditive)
+                {
+                    fillRGB565Span(framebuffer, bufferIndex, xEnd - xStart + 1, color);
+                }
+                else
+    #endif
             for (int x = xStart; x <= xEnd;
                  x++, ew0 += dw0_dx_step, ew1 += dw1_dx_step, ew2 += dw2_dx_step, bufferIndex++ JET_LIT_STEP JET_UV_STEP)
                 {
