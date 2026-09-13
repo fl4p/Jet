@@ -883,6 +883,8 @@ void Scene::prepareFrame() {
         // Every growth must be followed by another emit pass, or the frame keeps the truncated attempt while the larger buffer
         // sits unused: with a 256-entry cap on a 557-triangle scene the old two-iteration loop grew to 576 and still emitted only
         // 384, losing 3617 pixels (reviewer finding 1). Caps 0 and 1 also never grew, because cap + cap/2 == cap.
+        // Eight emit passes, so at most SEVEN growths; from cap 0 the capacities run 0,16,40,76,130,211,332,514.
+        // Eight emit passes, so at most SEVEN growths; from cap 0 the capacities run 0,16,40,76,130,211,332,514.
         for (int attempt = 0; attempt < 8; ++attempt) {
             for (PrepareLane& L : lanes) { L.drawnObjs = 0; for (int q = 0; q < 32; ++q) { L.prof_cnt[q] = 0; L.prof_cyc[q] = 0; } }
             setup_lanes(cap);
@@ -1592,8 +1594,12 @@ void PERF_CRITICAL Scene::renderObject(PrepareLane& L, Object* obj,
     // need intra-bucket ordering (measured 2026-09-12 on an ESP32-S3: 0.7 ms
     // per frame for a 65-object heightfield). Objects in the ignoreZBuffer
     // overlay band rely on it for their own back-to-front order.
+    // The stamp is written AFTER the sort: publishing it first would let a second head skip while this one is still
+    // permuting the vector. NOTE the key is the MESH, while the comparator uses vertices transformed for the HEAD
+    // object, so two heads sharing one LOD mesh at different rotations would inherit the first head's order (and race
+    // on the stamp). The valley never shares a sortable mesh - its terrain sets sortTriangles=false and the plane is
+    // owned outright - but this is not a general-purpose cache. (reviewer finding 3)
     if (obj->sortTriangles && meshSource->trianglesSortedStamp != prepareStamp) {
-    meshSource->trianglesSortedStamp = prepareStamp;
     std::sort(meshSource->triangles.begin(), meshSource->triangles.end(), [&](const Object::Triangle& a, const Object::Triangle& b) {
         const auto& v1 = transformedVertices[a.v1];
         const auto& v2 = transformedVertices[a.v2];
@@ -1603,6 +1609,7 @@ void PERF_CRITICAL Scene::renderObject(PrepareLane& L, Object* obj,
         int32_t z3 = v3.position.z;
         return (z1 + z2 + z3) / 3 > (transformedVertices[b.v1].position.z + transformedVertices[b.v2].position.z + transformedVertices[b.v3].position.z) / 3;
     });
+    meshSource->trianglesSortedStamp = prepareStamp;
     }
 #endif
 
