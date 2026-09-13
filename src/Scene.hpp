@@ -97,8 +97,10 @@ public:
     ///        concurrent calls with non-overlapping y ranges are safe when Z_BUFFERING==0.
     ///
     ///        May be called from multiple threads simultaneously with disjoint bands.
-    // Parallel callers supply separate zeroed flags (lastFrameDrawnTriangles
-    // bytes each), then OR them after joining to count unique triangles.
+    // Parallel callers supply separate zeroed flags, then OR them after joining to count unique triangles.
+    // The array must hold triangleFlagsBytes() entries, NOT lastFrameDrawnTriangles: split prepare leaves the queue SPARSE
+    // (lane 0 fills from 0, lane 1 from lane1RegionBegin()), and the flags are indexed by the PHYSICAL queue slot. A 559-triangle
+    // frame reached physical index 597; sizing by the drawn count is a heap overflow (reviewer finding 3).
     // With flags supplied this does not write shared frame statistics.
     void rasterizeBand(int yMin, int yMax, uint8_t* triangleFlags = nullptr);
     /// @brief Depth gate for rasterizeBand(): only queued triangles whose painter's
@@ -128,6 +130,9 @@ public:
     uint32_t queueCapTriangles() const { return queueCap; }
     uint32_t prepareOverflowCount() const { return prepareOverflows; }   // frames redone serially (a lane region filled up)
     uint32_t queueGrowthCount() const { return queueGrowths; }           // buffer reallocations: must stay 0 on the S3 (PSRAM)
+    uint32_t prepareTruncationCount() const { return prepareTruncations; } // frames that STILL overflowed after 8 growths: triangles were dropped
+    /// @brief Size a rasterizeBand() triangleFlags array. Indices are physical queue slots, which split prepare leaves sparse.
+    int triangleFlagsBytes() const { return static_cast<int>(queueCap); }
     void setPrepareExecutor(const PrepareExecutor& e) { prepareExecutor = e; }
     PrepareExecutor prepareExecutor;
     size_t lastPrepareSplit = 0;   // objects index where lane 1 started (0 = serial), for diagnostics
@@ -259,6 +264,13 @@ private:
     // 42 of RenderTri's 112. Dropping them fits ~1400 triangles in the S3's internal RAM instead of ~900, and the
     // queue living in PSRAM costs 7-8 fps (measured). A scene with any non-flat triangle must NOT build with this:
     // emitTri counts such triangles in nonFlatEmitted and the caller is expected to check it (the valley's are all flat).
+// JET_FLAT_KERNEL is opt-in and has no default definition anywhere, so `#if JET_FLAT_KERNEL` silently reads 0 in any translation
+// unit that forgets -D. That is not a harmless default: the general path reads live materials and lights while rasterising, so a
+// host tool built without it proves the WRONG path (stepearly: 3177 of 3600 frames differ, single-threaded, by order alone).
+// Defining it here lets callers test and report the value rather than mis-evaluate it.
+#ifndef JET_FLAT_KERNEL
+#define JET_FLAT_KERNEL 0
+#endif
 #ifndef JET_QUEUE_FLAT_ONLY
 #define JET_QUEUE_FLAT_ONLY 0
 #endif
@@ -392,6 +404,8 @@ private:
     uint32_t prepareOverflows = 0;   // frames redone serially because a lane region filled up
     uint32_t nonFlatEmitted = 0;     // JET_QUEUE_FLAT_ONLY: triangles the queue cannot describe (must stay 0)
     uint32_t queueGrowths = 0;       // times the buffer itself was too small and had to grow (must stay 0: a grown buffer can land in PSRAM)
+    uint32_t prepareStamp = 0;       // bumped once per renderPrepare; Object::trianglesSortedStamp keys the per-frame depth sort off it
+    uint32_t prepareTruncations = 0; // frames abandoned after 8 growths without fitting: the ONLY path on which a triangle is lost
     uint32_t laneHigh[2] = {0, 0};   // decaying high-water of each lane's emitted triangles; the regions are sized from these, not from a mean
 #if TEXTURE_MAPPING
     std::vector<TriangleUV> lane1Texture;

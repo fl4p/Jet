@@ -809,6 +809,7 @@ void Scene::prepareFrame() {
 #endif
     for (PrepareLane& L : lanes) { L.drawnObjs = 0; for (int q = 0; q < 32; ++q) { L.prof_cnt[q] = 0; L.prof_cyc[q] = 0; } }
     prepCam[0] = camCosX; prepCam[1] = camSinX; prepCam[2] = camCosY; prepCam[3] = camSinY; prepCam[4] = camCosZ; prepCam[5] = camSinZ;
+    ++prepareStamp;   // one depth sort per mesh per frame: the overflow redo must not re-sort (see Object::trianglesSortedStamp)
     const size_t nObjs = objects.size();
     lastPrepareSplit = 0;
     if (prepareExecutor.start && prepareExecutor.join && nObjs > 1) {
@@ -879,13 +880,17 @@ void Scene::prepareFrame() {
         if (lanes[1].q.over || lanes[1].bkt.over) laneHigh[1] += laneHigh[1] / 4 + 16;
         // A region filled up. Redo the frame serially over the whole buffer; if that overflows too the buffer itself is too small,
         // so grow it (counted and reported - a grown buffer can land in PSRAM, which costs 7-8 fps) and redo once more.
-        for (int attempt = 0; attempt < 2; ++attempt) {
+        // Every growth must be followed by another emit pass, or the frame keeps the truncated attempt while the larger buffer
+        // sits unused: with a 256-entry cap on a 557-triangle scene the old two-iteration loop grew to 576 and still emitted only
+        // 384, losing 3617 pixels (reviewer finding 1). Caps 0 and 1 also never grew, because cap + cap/2 == cap.
+        for (int attempt = 0; attempt < 8; ++attempt) {
             for (PrepareLane& L : lanes) { L.drawnObjs = 0; for (int q = 0; q < 32; ++q) { L.prof_cnt[q] = 0; L.prof_cyc[q] = 0; } }
             setup_lanes(cap);
             prepareObjects(lanes[0], 0, nObjs);
             if (!lanes[0].q.over && !lanes[0].bkt.over) break;
+            if (attempt == 7) { ++prepareTruncations; break; }   // give up rather than grow without bound; the caller can see it
             ++queueGrowths;
-            queueCap = queueCap + queueCap / 2;
+            queueCap = queueCap + queueCap / 2 + 16;   // the +16 keeps caps 0 and 1 from being fixed points
             renderQueue.resize(queueCap); renderBuckets.resize(queueCap); renderYSpan.resize(2 * queueCap);
             renderOrder.reserve(queueCap);
             cap = queueCap;
@@ -1587,7 +1592,8 @@ void PERF_CRITICAL Scene::renderObject(PrepareLane& L, Object* obj,
     // need intra-bucket ordering (measured 2026-09-12 on an ESP32-S3: 0.7 ms
     // per frame for a 65-object heightfield). Objects in the ignoreZBuffer
     // overlay band rely on it for their own back-to-front order.
-    if (obj->sortTriangles)
+    if (obj->sortTriangles && meshSource->trianglesSortedStamp != prepareStamp) {
+    meshSource->trianglesSortedStamp = prepareStamp;
     std::sort(meshSource->triangles.begin(), meshSource->triangles.end(), [&](const Object::Triangle& a, const Object::Triangle& b) {
         const auto& v1 = transformedVertices[a.v1];
         const auto& v2 = transformedVertices[a.v2];
@@ -1597,6 +1603,7 @@ void PERF_CRITICAL Scene::renderObject(PrepareLane& L, Object* obj,
         int32_t z3 = v3.position.z;
         return (z1 + z2 + z3) / 3 > (transformedVertices[b.v1].position.z + transformedVertices[b.v2].position.z + transformedVertices[b.v3].position.z) / 3;
     });
+    }
 #endif
 
     // ------------------------------------------------------------------

@@ -106,6 +106,14 @@ public:
     /// static meshes to save the sort (an ESP32-S3 heightfield measured 0.7 ms/frame).
     bool sortTriangles = true;
 
+    /// @brief Scene-private: the prepare pass that last depth-sorted `triangles`.
+    /// Split prepare redoes a whole frame serially when a lane region overflows, and
+    /// std::sort is unstable, so re-sorting the already-sorted vector could return a
+    /// different permutation of equal-depth triangles and change painter order for a
+    /// frame the redo must reproduce exactly (reviewer finding 2). Sorting once per
+    /// prepare stamp is both correct and cheaper than sorting twice.
+    uint32_t trianglesSortedStamp = 0;
+
     /// @brief Lighting precompute hint for Scene::renderObject (LIGHTING builds).
     /// 0 = scan the materials every frame (default), 1 = all materials are known
     /// non-specular (object-local Lambert per vertex, no scan), 2 = all materials
