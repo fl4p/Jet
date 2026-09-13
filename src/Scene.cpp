@@ -10,6 +10,12 @@
 #include <cstring> // For memset
 #include <algorithm> // For std::min, std::max
 #include <cmath> // For sqrtf (per-object distance fade / LOD pick)
+#ifndef JET_CULL_SLIVERS
+#define JET_CULL_SLIVERS 1   // drop triangles thinner than half a pixel at emit time (see emitTri)
+#endif
+#if JET_CULL_SLIVERS
+namespace Renderer { float jetSliverMinThickness = 0.25f; }   // pixels (alpha < 64 is invisible on RGB565); 0 disables, host tools set it for A/B
+#endif
 
 namespace Renderer {
 
@@ -1219,9 +1225,10 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         fM10 = fCamM10; fM11 = fCamM11; fM12 = fCamM12;
         fM20 = fCamM20; fM21 = fCamM21; fM22 = fCamM22;
     }
-    const float fDx = (float)(objPos.x - camPos.x);
-    const float fDy = (float)(objPos.y - camPos.y);
-    const float fDz = (float)(objPos.z - camPos.z);
+    const int32_t iDx = objPos.x - camPos.x, iDy = objPos.y - camPos.y, iDz = objPos.z - camPos.z;
+    const float fDx = (float)iDx;
+    const float fDy = (float)iDy;
+    const float fDz = (float)iDz;
     const float fTx = fCamM00*fDx + fCamM01*fDy + fCamM02*fDz;
     const float fTy = fCamM10*fDx + fCamM11*fDy + fCamM12*fDz;
     const float fTz = fCamM20*fDx + fCamM21*fDy + fCamM22*fDz;
@@ -1332,7 +1339,21 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         // here with their yaw pre-rotation already applied and fM equal to
         // the bare camera matrix, which reproduces the old pipeline order
         // exactly.
-        {
+        if (!objHasRotation && !isBillboard) {
+            // Unrotated object: add the world offset in EXACT integer arithmetic
+            // before the float camera rotation. Two objects that share a world
+            // vertex (adjacent terrain strips: local z = 100 in one, 0 in the
+            // next, positions 100 apart) then feed bit-identical floats into the
+            // same matrix and truncate to the same camera-space integers. With
+            // the translation folded in as a float (fT) the two paths rounded
+            // differently by up to one unit, opening sub-pixel cracks along
+            // every seam (strings of single background pixels on the glass).
+            const float fpx = (float)(pos.x + iDx), fpy = (float)(pos.y + iDy), fpz = (float)(pos.z + iDz);
+            pos.assign(
+                (int32_t)(fpx * fM00 + fpy * fM01 + fpz * fM02),
+                (int32_t)(fpx * fM10 + fpy * fM11 + fpz * fM12),
+                (int32_t)(fpx * fM20 + fpy * fM21 + fpz * fM22));
+        } else {
             const float fpx = (float)pos.x, fpy = (float)pos.y, fpz = (float)pos.z;
             pos.assign(
                 (int32_t)(fpx * fM00 + fpy * fM01 + fpz * fM02 + fTx),
@@ -1558,6 +1579,35 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
             case CullingMode::NO_CULLING: break;
         }
         if (shouldCull) return;
+#if JET_CULL_SLIVERS
+        // Hairline triangles: a face seen almost edge-on projects to a long
+        // sliver a fraction of a pixel thick, and the inclusive span rule
+        // still paints at least one pixel per row of it, so a quarter-pixel
+        // crest facet became a solid line of single bright pixels across the
+        // slope behind it (measured 2026-09-13, esp-flightscene2: area 3.5
+        // px^2 over 31 px). Dropping them instead punched the same dotted
+        // line in the sky colour along ridge silhouettes. So: thinner than a
+        // pixel -> blend it with alpha = its thickness (coverage), thinner
+        // than jetSliverMinThickness -> drop. Thickness = 2*area/L for the
+        // longest edge L. Also removes back faces the integer shoelace
+        // flipped to "front" (their area is ~0).
+        uint8_t sliverAlpha = 255;
+        {
+            const int64_t dx1 = b.position.x - a.position.x, dy1 = b.position.y - a.position.y;
+            const int64_t dx2 = c.position.x - b.position.x, dy2 = c.position.y - b.position.y;
+            const int64_t dx3 = a.position.x - c.position.x, dy3 = a.position.y - c.position.y;
+            int64_t l2 = dx1 * dx1 + dy1 * dy1;
+            const int64_t l2b = dx2 * dx2 + dy2 * dy2, l2c = dx3 * dx3 + dy3 * dy3;
+            if (l2b > l2) l2 = l2b;
+            if (l2c > l2) l2 = l2c;
+            const int64_t a2 = shoelaceArea < 0 ? -shoelaceArea : shoelaceArea;
+            if (a2 * a2 < l2) {                                   // thinner than one pixel
+                const float th = (float)a2 / sqrtf((float)l2);
+                if (th < jetSliverMinThickness) return;
+                sliverAlpha = (uint8_t)(th * 255.0f);
+            }
+        }
+#endif
 #if JET_PROFILE
         const uint32_t jpe1 = jet_prof_now(); jet_prof_cyc[JP_EMIT_CULL] += jpe1 - jpe.t0;
 #endif
@@ -1584,6 +1634,9 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         rt.noWriteZBuffer = noWriteZBuffer;
         rt.zBias          = obj->zBias;
         rt.objAlpha       = objAlpha;
+#if JET_CULL_SLIVERS
+        if (sliverAlpha != 255) rt.objAlpha = (uint8_t)(((uint16_t)rt.objAlpha * sliverAlpha) / 255);
+#endif
         rt.avgZ           = avgZ;
         rt.brightnessPrecomputed = false;
 #if LIGHTING
@@ -1601,7 +1654,7 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         // blend, no engine depth fog, and either emissive/UNLIT or FLAT with the
         // object-local Lambert already in v1.
         rt.flatOpaque = false;
-        if (mat && objAlpha == 255 && mat->alpha == 255 &&
+        if (mat && rt.objAlpha == 255 && mat->alpha == 255 &&           // rt.objAlpha: a coverage-blended sliver takes the general path
             mat->shadingMode != ShadingMode::WATER_REFLECT && mat->shadingMode != ShadingMode::ADDITIVE
 #if DEPTH_ALPHA_BLEND && FAST_Z
             && avgZ <= depthFogNear

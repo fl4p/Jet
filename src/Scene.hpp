@@ -18,6 +18,8 @@ namespace Renderer {
 /// Holds the active camera, lights, object list and per-frame state, and
 /// exposes a single `render()` entry point that runs the full
 /// transform/cull/raster/post-FX pipeline.
+extern float jetSliverMinThickness;   // JET_CULL_SLIVERS: emit-time hairline cull threshold in pixels (Scene.cpp)
+
 class Scene {
 public:
     /// @brief Construct a scene bound to caller-owned framebuffers.
