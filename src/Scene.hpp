@@ -272,6 +272,10 @@ private:
         // calls in that case and reads the cached values directly. Only
         // ever set for objects whose materials are all non-specular.
         bool brightnessPrecomputed : 1;
+        // JET_CULL_SLIVERS: the sort key carried jetSliverPushZ (a hairline sorted behind its
+        // neighbours); setBandDepthGate classifies by the same key (reviewer: the gate rebuilt
+        // the key without it, so a pushed sliver could land in the other pass).
+        bool sliverPushed : 1;
         int8_t zBias;
         // Per-object alpha multiplier (255 = no per-object fade); folded
         // into the per-pixel screen-door alpha at raster time.

@@ -872,7 +872,10 @@ void Scene::rasterizeBand(int yMin, int yMax, uint8_t* triangleFlags) {
         if (!useList && (renderYSpan[2 * idx + 1] < yMin || renderYSpan[2 * idx] >= yMax)) continue;
         const RenderTri& t = renderQueue[idx];
         if (bandKeyMin != INT32_MIN || bandKeyMax != INT32_MAX) {   // setBandDepthGate: far / near split around an externally drawn layer
-            const int32_t key = t.avgZ - static_cast<int32_t>(t.zBias) * 256;
+            int32_t key = t.avgZ - static_cast<int32_t>(t.zBias) * 256;   // the sort key of emitTri
+#if JET_CULL_SLIVERS
+            if (t.sliverPushed) key += jetSliverPushZ;
+#endif
             if (key < bandKeyMin || key >= bandKeyMax) continue;
         }
 #if JET_FLAT_KERNEL
@@ -1659,6 +1662,11 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         rt.objAlpha       = objAlpha;
         rt.avgZ           = avgZ;
         rt.brightnessPrecomputed = false;
+#if JET_CULL_SLIVERS
+        rt.sliverPushed   = sliverPush != 0;
+#else
+        rt.sliverPushed   = false;
+#endif
 #if LIGHTING
         rt.brightnessPrecomputed = objectLocalLight;
 #endif
