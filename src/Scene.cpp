@@ -1002,8 +1002,11 @@ int Scene::rasterizeBandImpl(int yMin, int yMax, uint8_t* triangleFlags, uint16_
         if (!useList && (renderYSpan[2 * idx + 1] < yMin || renderYSpan[2 * idx] >= yMax)) continue;
         const RenderTri& t = renderQueue[idx];
         if (keyMin != INT32_MIN || keyMax != INT32_MAX) {   // setBandDepthGate: far / near split around an externally drawn layer
-            const int32_t key = t.avgZ - static_cast<int32_t>(t.zBias) * 256;
-            if (key < keyMin || key >= keyMax) continue;
+            int32_t key = t.avgZ - static_cast<int32_t>(t.zBias) * 256;   // the sort key of emitTri
+#if JET_CULL_SLIVERS
+            if (t.sliverPushed) key += jetSliverPushZ;   // the pushed hairline must classify where it sorts (upstream fix)
+#endif
+            if (key < keyMin || key >= keyMax) continue;   // parameters, not members: rasterizeBandInto is called from two cores
         }
 #if JET_FLAT_KERNEL
         if (t.flatOpaque && !bandRast.wireframeMode && !bandRast.interlacedMode && !bandRast.checkerboardMode) {
@@ -1796,6 +1799,11 @@ void PERF_CRITICAL Scene::renderObject(PrepareLane& L, Object* obj,
         rt.objAlpha       = objAlpha;
         rt.avgZ           = avgZ;
         rt.brightnessPrecomputed = false;
+#if JET_CULL_SLIVERS
+        rt.sliverPushed   = sliverPush != 0;
+#else
+        rt.sliverPushed   = false;
+#endif
 #if LIGHTING
         rt.brightnessPrecomputed = objectLocalLight;
 #endif
