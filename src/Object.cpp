@@ -195,6 +195,7 @@ namespace Renderer
 
     void Object::setRotation(int32_t rotX, int32_t rotY, int32_t rotZ)
     {
+        rotationFloat = false;
         rotation.x = rotX % ANGLE_MAX;
         rotation.y = rotY % ANGLE_MAX;
         rotation.z = rotZ % ANGLE_MAX;
@@ -207,6 +208,7 @@ namespace Renderer
 
     void Object::rotate(int32_t angleX, int32_t angleY, int32_t angleZ)
     {
+        rotationFloat = false;
         rotation.x = (rotation.x + angleX + ANGLE_MAX) % ANGLE_MAX;
         rotation.y = (rotation.y + angleY + ANGLE_MAX) % ANGLE_MAX;
         rotation.z = (rotation.z + angleZ + ANGLE_MAX) % ANGLE_MAX;
@@ -218,6 +220,29 @@ namespace Renderer
         rotation.x %= ANGLE_MAX;
         rotation.y %= ANGLE_MAX;
         rotation.z %= ANGLE_MAX;
+    }
+
+    void Object::setRotationF(float rx, float ry, float rz)
+    {
+        rotationFloat = true;
+        rotFx = rx; rotFy = ry; rotFz = rz;
+        rotation.x = ((int32_t)rx) % ANGLE_MAX;
+        rotation.y = ((int32_t)ry) % ANGLE_MAX;
+        rotation.z = ((int32_t)rz) % ANGLE_MAX;
+    }
+
+    void Object::rotateF(float rx, float ry, float rz)
+    {
+        if (!rotationFloat) {
+            rotFx = (float)rotation.x; rotFy = (float)rotation.y; rotFz = (float)rotation.z;
+            rotationFloat = true;
+        }
+        rotFx = fmodf(rotFx + rx, 360.0f);
+        rotFy = fmodf(rotFy + ry, 360.0f);
+        rotFz = fmodf(rotFz + rz, 360.0f);
+        rotation.x = (int32_t)rotFx;
+        rotation.y = (int32_t)rotFy;
+        rotation.z = (int32_t)rotFz;
     }
 
     void Object::translate(int32_t dx, int32_t dy, int32_t dz)

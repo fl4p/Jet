@@ -130,13 +130,23 @@ bool Scene::cullObject(Object* obj,
             return false;   // fully inside — skip the 8-corner test
     }
 
-    const bool rotated = obj->rotation.x != 0 || obj->rotation.y != 0 || obj->rotation.z != 0;
+    const bool rotated = obj->rotation.x != 0 || obj->rotation.y != 0 || obj->rotation.z != 0
+                         || obj->rotationFloat;
     int32_t objCosX=FIXED_POINT_SCALE, objSinX=0, objCosY=FIXED_POINT_SCALE, objSinY=0;
     int32_t objCosZ=FIXED_POINT_SCALE, objSinZ=0;
     if (rotated) {
+#if FLOAT_CAMERA_ANGLES
+        if (obj->rotationFloat) {
+            objCosX=(int32_t)(lookupCos(obj->rotFx)*FIXED_POINT_SCALE); objSinX=(int32_t)(lookupSin(obj->rotFx)*FIXED_POINT_SCALE);
+            objCosY=(int32_t)(lookupCos(obj->rotFy)*FIXED_POINT_SCALE); objSinY=(int32_t)(lookupSin(obj->rotFy)*FIXED_POINT_SCALE);
+            objCosZ=(int32_t)(lookupCos(obj->rotFz)*FIXED_POINT_SCALE); objSinZ=(int32_t)(lookupSin(obj->rotFz)*FIXED_POINT_SCALE);
+        } else
+#endif
+        {
         objCosX=lookupCosI(obj->rotation.x); objSinX=lookupSinI(obj->rotation.x);
         objCosY=lookupCosI(obj->rotation.y); objSinY=lookupSinI(obj->rotation.y);
         objCosZ=lookupCosI(obj->rotation.z); objSinZ=lookupSinI(obj->rotation.z);
+        }
     }
 
     for (int i = 0; i < 8; ++i) {
@@ -1027,7 +1037,7 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
     // rotation block when the object has zero rotation (true for most static
     // scenery), saving 12 mul + 6 div + 9 add per vertex.
     const bool objHasRotation = !isBillboard &&
-        (obj->rotation.x != 0 || obj->rotation.y != 0 || obj->rotation.z != 0);
+        (obj->rotation.x != 0 || obj->rotation.y != 0 || obj->rotation.z != 0 || obj->rotationFloat);
 
     // Composed object rotation matrix (Rz * Ry * Rx, since the previous
     // per-vertex code applied X→Y→Z). Storing all 9 entries at
@@ -1048,12 +1058,25 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
     float fObjM10=0.0f, fObjM11=1.0f, fObjM12=0.0f;
     float fObjM20=0.0f, fObjM21=0.0f, fObjM22=1.0f;
     if (objHasRotation) {
-        const int32_t cx = lookupCosI(obj->rotation.x);
-        const int32_t sx = lookupSinI(obj->rotation.x);
-        const int32_t cy = lookupCosI(obj->rotation.y);
-        const int32_t sy = lookupSinI(obj->rotation.y);
-        const int32_t cz = lookupCosI(obj->rotation.z);
-        const int32_t sz = lookupSinI(obj->rotation.z);
+#if FLOAT_CAMERA_ANGLES
+        int32_t cx, sx, cy, sy, cz, sz;
+        if (obj->rotationFloat) {
+            cx = (int32_t)(lookupCos(obj->rotFx)*FIXED_POINT_SCALE);
+            sx = (int32_t)(lookupSin(obj->rotFx)*FIXED_POINT_SCALE);
+            cy = (int32_t)(lookupCos(obj->rotFy)*FIXED_POINT_SCALE);
+            sy = (int32_t)(lookupSin(obj->rotFy)*FIXED_POINT_SCALE);
+            cz = (int32_t)(lookupCos(obj->rotFz)*FIXED_POINT_SCALE);
+            sz = (int32_t)(lookupSin(obj->rotFz)*FIXED_POINT_SCALE);
+        } else
+#endif
+        {
+        const int32_t cx_ = lookupCosI(obj->rotation.x); cx = cx_;
+        const int32_t sx_ = lookupSinI(obj->rotation.x); sx = sx_;
+        const int32_t cy_ = lookupCosI(obj->rotation.y); cy = cy_;
+        const int32_t sy_ = lookupSinI(obj->rotation.y); sy = sy_;
+        const int32_t cz_ = lookupCosI(obj->rotation.z); cz = cz_;
+        const int32_t sz_ = lookupSinI(obj->rotation.z); sz = sz_;
+        }
         // K = Ry * Rx (at FPS scale; trig-product entries divided once).
         const int32_t k00 = cy;
         const int32_t k01 = (int32_t)((int64_t)sy * sx / FIXED_POINT_SCALE);

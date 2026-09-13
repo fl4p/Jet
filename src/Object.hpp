@@ -223,6 +223,14 @@ public:
     /// @param rot Delta rotation vector.
     void rotate(const Vector3& rot);
 
+    /// Sub-degree rotation (0.1° LUT resolution when FLOAT_CAMERA_ANGLES).
+    /// The float triple wins over `rotation` while rotationFloat is set;
+    /// the int fields stay in sync (truncated) for readers like cull caches.
+    float rotFx = 0.0f, rotFy = 0.0f, rotFz = 0.0f;
+    bool rotationFloat = false;
+    void rotateF(float rx, float ry, float rz);
+    void setRotationF(float rx, float ry, float rz);
+
     /// @brief Translate the object in world space.
     /// @param dx Delta X.
     /// @param dy Delta Y.
