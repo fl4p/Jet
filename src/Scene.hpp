@@ -301,24 +301,13 @@ private:
     // else, and the 14 bytes of normal + brightness per vertex are 42 of RenderTri's 112. The transform scratch above
     // keeps them - lighting still runs per vertex before emit, it just is not carried into the queue.
 #if JET_QUEUE_FLAT_ONLY
+    // Position only. The three Lambert brightnesses live in RenderTri::lb[] instead of beside each position: a 12 B position plus a
+    // 2 B brightness aligns to 16 B, wasting 2 B per vertex, and together with flatColor placed next to them that padding is what
+    // took the device entry from 56 B to 64 B. At 64 B the x4 detail queue (~2 032 entries) cannot fit the S3's largest internal
+    // RAM region (120 KiB, measured at boot) and lands in PSRAM; at 56 B 2 100 entries are 117 600 B and do.
     struct QueuedVertex {
         Vector3 position;
-#if LIGHTING
-        uint16_t lambertBrightness = 0;   // kept: the flat colour is computed from v1's, and padding makes it free
-#endif
-        template<class V> void assign(const V& v) {
-            position = v.position;
-#if LIGHTING
-            lambertBrightness = v.lambertBrightness;
-#endif
-        }
-        RenderVertex expand() const {
-            RenderVertex v; v.position = position;
-#if LIGHTING
-            v.lambertBrightness = lambertBrightness;
-#endif
-            return v;
-        }
+        template<class V> void assign(const V& v) { position = v.position; }
     };
 #else
     using QueuedVertex = PipelineVertex;
@@ -329,14 +318,22 @@ private:
 #endif
     struct RenderTri {
         QueuedVertex v1, v2, v3;
+#if JET_QUEUE_FLAT_ONLY
+#if LIGHTING
+        uint16_t lb[3] = {0, 0, 0};   // Lambert brightness of v1, v2, v3 (see QueuedVertex for why they are not inside it)
+#endif
+        uint16_t flatColor = 0;       // placed here, not after avgZ, so the small fields fill the gap before `material` (56 B on Xtensa)
+#endif
 #if TEXTURE_MAPPING
         uint32_t uvIndex;
 #endif
         Material* material;
         int32_t avgZ;
+#if !JET_QUEUE_FLAT_ONLY
         // JET_FLAT_KERNEL: FLAT/UNLIT, alpha 255, colour fixed at emit time (RenderTri is 100 B on Xtensa)
         // (already in wire order): rasterizeBand draws it without drawTriangle.
         uint16_t flatColor = 0;
+#endif
         bool flatOpaque = false;
         // Pack the three booleans together so the UV index replaces
         // padding rather than growing the total payload of textured faces.
@@ -356,6 +353,35 @@ private:
         // Per-object alpha multiplier (255 = no per-object fade); folded
         // into the per-pixel screen-door alpha at raster time.
         uint8_t objAlpha;
+        // Layout-independent access to the three queued vertices (flat-only keeps brightness in lb[], the wide queue in the vertex).
+        template<class V> void setV(int i, const V& v) {
+            QueuedVertex& q = i == 0 ? v1 : (i == 1 ? v2 : v3);
+            q.assign(v);
+#if JET_QUEUE_FLAT_ONLY && LIGHTING
+            lb[i] = v.lambertBrightness;
+#endif
+        }
+        RenderVertex expandV(int i) const {
+            const QueuedVertex& q = i == 0 ? v1 : (i == 1 ? v2 : v3);
+#if JET_QUEUE_FLAT_ONLY
+            RenderVertex v; v.position = q.position;
+#if LIGHTING
+            v.lambertBrightness = lb[i];
+#endif
+            return v;
+#else
+            return q.expand();
+#endif
+        }
+#if LIGHTING
+        uint16_t brightness1() const {
+#if JET_QUEUE_FLAT_ONLY
+            return lb[0];
+#else
+            return v1.lambertBrightness;
+#endif
+        }
+#endif
 #if MAX_PICK_QUERIES > 0
         // Source object + ORIGINAL triangle index (in obj->triangles) for
         // pick attribution. Carried through the painter sort.

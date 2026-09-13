@@ -1056,7 +1056,7 @@ int Scene::rasterizeBandImpl(int yMin, int yMax, uint8_t* triangleFlags, uint16_
         // t.avgZ rides along as the FAST_Z depth hint: emitTri computed the
         // same three-vertex average and already culled it against near/far,
         // so drawTriangle skips both the recompute and the redundant test.
-        RenderVertex a = t.v1.expand(), b = t.v2.expand(), c = t.v3.expand();
+        RenderVertex a = t.expandV(0), b = t.expandV(1), c = t.expandV(2);
 #if TEXTURE_MAPPING
         if (t.uvIndex != UINT32_MAX) {
             const TriangleUV& uv = textureQueue[t.uvIndex];
@@ -1793,9 +1793,9 @@ void PERF_CRITICAL Scene::renderObject(PrepareLane& L, Object* obj,
         RenderTri& rt = renderQueue.emplace_back();   // built in place in this lane's region; overflow returns a sink and is counted
         const bool reverse = cullingMode == CullingMode::NO_CULLING && shoelaceArea < 0;
         if (reverse) {
-            rt.v1.assign(c); rt.v2.assign(b); rt.v3.assign(a);
+            rt.setV(0, c); rt.setV(1, b); rt.setV(2, a);
         } else {
-            rt.v1.assign(a); rt.v2.assign(b); rt.v3.assign(c);
+            rt.setV(0, a); rt.setV(1, b); rt.setV(2, c);
         }
 #if TEXTURE_MAPPING
         rt.uvIndex = UINT32_MAX;
@@ -1846,7 +1846,7 @@ void PERF_CRITICAL Scene::renderObject(PrepareLane& L, Object* obj,
                 rt.flatOpaque = true;
             } else if (flatShaded && (rt.brightnessPrecomputed || !directionalLight)) {
                 // drawTriangleImpl: no lights at all -> full brightness; ambient only -> 0 (tint)
-                const uint16_t brightness = directionalLight ? rt.v1.lambertBrightness : (ambientLight ? 0 : 255);
+                const uint16_t brightness = directionalLight ? rt.brightness1() : (ambientLight ? 0 : 255);
                 const uint8_t ambR = ambientLight ? ambientLight->color.r : 0;
                 const uint8_t ambG = ambientLight ? ambientLight->color.g : 0;
                 const uint8_t ambB = ambientLight ? ambientLight->color.b : 0;
