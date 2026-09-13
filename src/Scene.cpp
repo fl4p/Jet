@@ -1601,11 +1601,10 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         // thickness >= 1, which is nearly every triangle.
         int32_t sliverPush = 0;
         {
-            int32_t minx = a.position.x, maxx = a.position.x, miny = a.position.y, maxy = a.position.y;
-            if (b.position.x < minx) minx = b.position.x; if (b.position.x > maxx) maxx = b.position.x;
-            if (c.position.x < minx) minx = c.position.x; if (c.position.x > maxx) maxx = c.position.x;
-            if (b.position.y < miny) miny = b.position.y; if (b.position.y > maxy) maxy = b.position.y;
-            if (c.position.y < miny) miny = c.position.y; if (c.position.y > maxy) maxy = c.position.y;
+            const int32_t minx = std::min({a.position.x, b.position.x, c.position.x});
+            const int32_t maxx = std::max({a.position.x, b.position.x, c.position.x});
+            const int32_t miny = std::min({a.position.y, b.position.y, c.position.y});
+            const int32_t maxy = std::max({a.position.y, b.position.y, c.position.y});
             const int64_t a2 = shoelaceArea < 0 ? -shoelaceArea : shoelaceArea;
             if (a2 < (int64_t)(maxx - minx) + (maxy - miny)) {
                 const int64_t dx1 = b.position.x - a.position.x, dy1 = b.position.y - a.position.y;
