@@ -254,6 +254,14 @@ public:
 private:
     // UVs are immutable mesh attributes, not transformed attributes. Keep
     // them out of the scratch vertices and the common triangle queue.
+    // JET_QUEUE_FLAT_ONLY: the queued vertex keeps only what the flat kernel reads (position). The normal and the
+    // Lambert brightness are what the GENERAL path needs, and they cost 14 of the 28 bytes per queued vertex, i.e.
+    // 42 of RenderTri's 112. Dropping them fits ~1400 triangles in the S3's internal RAM instead of ~900, and the
+    // queue living in PSRAM costs 7-8 fps (measured). A scene with any non-flat triangle must NOT build with this:
+    // emitTri counts such triangles in nonFlatEmitted and the caller is expected to check it (the valley's are all flat).
+#ifndef JET_QUEUE_FLAT_ONLY
+#define JET_QUEUE_FLAT_ONLY 0
+#endif
     struct PipelineVertex {
         Vector3 position;
 #if LIGHTING
@@ -277,12 +285,38 @@ private:
             return v;
         }
     };
+    // What the QUEUE stores per vertex. Under JET_QUEUE_FLAT_ONLY that is position only: the flat kernel reads nothing
+    // else, and the 14 bytes of normal + brightness per vertex are 42 of RenderTri's 112. The transform scratch above
+    // keeps them - lighting still runs per vertex before emit, it just is not carried into the queue.
+#if JET_QUEUE_FLAT_ONLY
+    struct QueuedVertex {
+        Vector3 position;
+#if LIGHTING
+        uint16_t lambertBrightness = 0;   // kept: the flat colour is computed from v1's, and padding makes it free
+#endif
+        template<class V> void assign(const V& v) {
+            position = v.position;
+#if LIGHTING
+            lambertBrightness = v.lambertBrightness;
+#endif
+        }
+        RenderVertex expand() const {
+            RenderVertex v; v.position = position;
+#if LIGHTING
+            v.lambertBrightness = lambertBrightness;
+#endif
+            return v;
+        }
+    };
+#else
+    using QueuedVertex = PipelineVertex;
+#endif
 #if TEXTURE_MAPPING
     struct TriangleUV { Vector2 a, b, c; };
     std::vector<TriangleUV> textureQueue;
 #endif
     struct RenderTri {
-        PipelineVertex v1, v2, v3;
+        QueuedVertex v1, v2, v3;
 #if TEXTURE_MAPPING
         uint32_t uvIndex;
 #endif
@@ -356,6 +390,7 @@ private:
     uint32_t queueCap = 0;        // triangles the single queue holds; lane 0 fills [0, lane1Begin), lane 1 [lane1Begin, queueCap)
     uint32_t lane0Count = 0, lane1Begin = 0, lane1Count = 0;
     uint32_t prepareOverflows = 0;   // frames redone serially because a lane region filled up
+    uint32_t nonFlatEmitted = 0;     // JET_QUEUE_FLAT_ONLY: triangles the queue cannot describe (must stay 0)
     uint32_t queueGrowths = 0;       // times the buffer itself was too small and had to grow (must stay 0: a grown buffer can land in PSRAM)
     uint32_t laneHigh[2] = {0, 0};   // decaying high-water of each lane's emitted triangles; the regions are sized from these, not from a mean
 #if TEXTURE_MAPPING

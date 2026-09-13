@@ -1841,6 +1841,10 @@ void PERF_CRITICAL Scene::renderObject(PrepareLane& L, Object* obj,
                 rt.flatOpaque = true;
             }
         }
+#if JET_QUEUE_FLAT_ONLY
+        // the reduced queue vertex cannot describe a triangle the general path would have to shade
+        if (!rt.flatOpaque) ++nonFlatEmitted;
+#endif
 #endif
 #if JET_PROFILE
         const uint32_t jpe2 = jet_prof_now(); L.prof_cyc[JP_EMIT_BUILD] += jpe2 - jpe1; ++L.prof_cnt[JP_EMIT_BUILD];
