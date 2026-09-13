@@ -858,7 +858,11 @@ void Scene::prepareFrame() {
                 // track the emit cost, and the device showed lane 1 taking 0.26..0.71 of the emitted triangles at a fixed 0.49 of the proxy
                 const double l0 = (double)pt.lane0, l1 = (double)pt.lane1;
                 if (l0 > 0 && l1 > 0) {
-                    prepareSplitFrac += (float)(0.1 * (l1 - l0) / (l0 + l1)) * prepareSplitFrac;
+                    // balance lane 1 against prepareLaneRatio x lane 0 (1 = equal times). Below 1 shifts objects to lane 0, which
+                    // runs on the caller's core: on the S3 lane 1 shares core 1 with the scene step, so equal ELAPSED times still
+                    // left core 1 saturated and core 0 idling 21-34 % (x4 detail, 2026-09-13).
+                    const double r = (double)prepareLaneRatio;
+                    prepareSplitFrac += (float)(0.1 * (l1 - r * l0) / (r * l0 + l1)) * prepareSplitFrac;
                     if (prepareSplitFrac < 0.2f) prepareSplitFrac = 0.2f;
                     if (prepareSplitFrac > 0.8f) prepareSplitFrac = 0.8f;
                 }

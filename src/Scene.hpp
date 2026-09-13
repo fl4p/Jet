@@ -130,6 +130,8 @@ public:
     uint32_t queueCapTriangles() const { return queueCap; }
     uint32_t prepareOverflowCount() const { return prepareOverflows; }   // frames redone serially (a lane region filled up)
     uint32_t queueGrowthCount() const { return queueGrowths; }           // buffer reallocations: must stay 0 on the S3 (PSRAM)
+    /// Split-prepare balance target: lane 1's time is steered toward ratio x lane 0's (1 = equal; < 1 moves work to the caller's lane).
+    void setPrepareLaneRatio(float ratio) { prepareLaneRatio = ratio > 0.05f ? ratio : 0.05f; }
     uint32_t prepareTruncationCount() const { return prepareTruncations; } // frames that STILL overflowed after 8 growths: triangles were dropped
     /// @brief Size a rasterizeBand() triangleFlags array. Indices are physical queue slots, which split prepare leaves sparse.
     int triangleFlagsBytes() const { return static_cast<int>(queueCap); }
@@ -430,6 +432,7 @@ private:
     uint32_t prepareOverflows = 0;   // frames redone serially because a lane region filled up
     uint32_t nonFlatEmitted = 0;     // JET_QUEUE_FLAT_ONLY: triangles the queue cannot describe (must stay 0)
     uint32_t queueGrowths = 0;       // times the buffer itself was too small and had to grow (must stay 0: a grown buffer can land in PSRAM)
+    float prepareLaneRatio = 1.0f;   // see setPrepareLaneRatio
     uint32_t prepareStamp = 0;       // bumped once per renderPrepare; Object::trianglesSortedStamp keys the per-frame depth sort off it
     uint32_t prepareTruncations = 0; // frames abandoned after 8 growths without fitting: the ONLY path on which a triangle is lost
     uint32_t laneHigh[2] = {0, 0};   // decaying high-water of each lane's emitted triangles; the regions are sized from these, not from a mean
