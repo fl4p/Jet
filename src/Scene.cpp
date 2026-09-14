@@ -15,8 +15,18 @@
 #endif
 #if JET_CULL_SLIVERS
 #ifndef JET_PACKED_BRIGHTNESS
-#define JET_PACKED_BRIGHTNESS 0   // 1: cache the object-local Lambert brightness in a stream parallel to the
-#endif                            //    packed positions, so prepare never touches the fat Object::Vertex
+#define JET_PACKED_BRIGHTNESS 1   // Cache the object-local Lambert brightness in a stream parallel to the packed
+#endif                            // positions, so prepare never touches the fat Object::Vertex. Device, x4 detail:
+                                  // prepare 20.3 -> 16.9 ms, frame 34.55 -> 31.29, 32.6 -> 35.2 fps. It needs the
+                                  // POSITION cache to be live (the scene must call cachePositions and keep it
+                                  // refreshed); with packed positions but this off, prepare still reads the vertex
+                                  // struct for the normal and the refresh is paid for nothing -- measured 22.7 ms,
+                                  // WORSE than no caching at all. The two only pay together.
+#if JET_PROFILE
+#define JET_EMIT_REJ(which) ++jet_prof_cnt[which];
+#else
+#define JET_EMIT_REJ(which)
+#endif
 namespace Renderer {
 float   jetSliverMinThickness = 0.05f;   // pixels: thinner than this is dropped (degenerate / sign-flipped back faces)
 float   jetSliverPushMaxThickness = 0.5f; // pixels: thinner than this is sorted behind its neighbours (see emitTri)
@@ -1574,15 +1584,14 @@ void PERF_CRITICAL Scene::renderObject(PrepareLane& L, Object* obj,
     const uint32_t jpv0 = jet_prof_now();
     L.prof_cyc[JP_OBJ] += jpv0 - jpo0;
 #endif
-    for (size_t vi = 0; vi < vertCount; ++vi) {
-        const Object::Vertex& srcVert = meshSource->vertices[vi];
-        PipelineVertex& dst = transformedVertices[vi];
-        const Vector3 pos = cameraPosition(packedPositions ? packedPositions[vi] : srcVert.position);
-#if LIGHTING
 #if JET_PACKED_BRIGHTNESS
-        if (packedBright) {   // streams only: no Object::Vertex read, no normal transform, no shading call.
-                              // Safe because objectLocalLight implies brightnessPrecomputed, and the
-                              // rasterizer then never looks at dst.normal (Renderer.cpp drawTriangle).
+    // A SEPARATE loop, not a branch inside the shared one: the first version tested `packedBright`
+    // per vertex and measured +84 us a frame on the device even though it did strictly less work.
+    // A per-iteration branch in a loop this tight is its own cost.
+    if (packedBright) {
+        for (size_t vi = 0; vi < vertCount; ++vi) {
+            PipelineVertex& dst = transformedVertices[vi];
+            const Vector3 pos = cameraPosition(packedPositions[vi]);
             float invZp;
 #if defined(__XTENSA__) && defined(ESP_PLATFORM)
             { const float fz = (float)pos.z; float r;
@@ -1594,10 +1603,19 @@ void PERF_CRITICAL Scene::renderObject(PrepareLane& L, Object* obj,
             dst.position.x = (int32_t)(pos.x * invZp) + screenWidth / 2;
             dst.position.y = screenHeight / 2 - (int32_t)(pos.y * invZp);
             dst.position.z = pos.z;
+#if LIGHTING
+            // No Object::Vertex read, no normal transform, no dst.normal write: objectLocalLight
+            // implies brightnessPrecomputed, so the rasterizer never looks at the normal.
             dst.lambertBrightness = sceneLambertApply(packedBright[vi], objLightIntensity, objDiffuseCoef);
-            continue;
-        }
 #endif
+        }
+    } else
+#endif
+    for (size_t vi = 0; vi < vertCount; ++vi) {
+        const Object::Vertex& srcVert = meshSource->vertices[vi];
+        PipelineVertex& dst = transformedVertices[vi];
+        const Vector3 pos = cameraPosition(packedPositions ? packedPositions[vi] : srcVert.position);
+#if LIGHTING
         Vector3 normal(srcVert.normal);
         // Normals use the combined ROTATION only — no translation. The
         // object-local-light path skips the transform entirely and shades
@@ -1784,12 +1802,15 @@ void PERF_CRITICAL Scene::renderObject(PrepareLane& L, Object* obj,
         struct JpEmitScope { uint32_t t0; uint32_t* cyc; uint32_t* cnt; ~JpEmitScope() { cyc[JP_EMIT] += jet_prof_now() - t0; ++cnt[JP_EMIT]; } } jpe{jet_prof_now(), L.prof_cyc, L.prof_cnt};
 #endif
         const int32_t avgZ = (a.position.z + b.position.z + c.position.z) / 3;
-        if (avgZ > camera->farPlane || avgZ < camera->nearPlane) return;
+#if JET_PROFILE
+        ++jet_prof_cnt[JP_EMIT_TRIED];
+#endif
+        if (avgZ > camera->farPlane || avgZ < camera->nearPlane) { JET_EMIT_REJ(JP_REJ_Z) return; }
 
-        if (a.position.x < 0 && b.position.x < 0 && c.position.x < 0) return;
-        if (a.position.x > screenWidth && b.position.x > screenWidth && c.position.x > screenWidth) return;
-        if (a.position.y < 0 && b.position.y < 0 && c.position.y < 0) return;
-        if (a.position.y > screenHeight && b.position.y > screenHeight && c.position.y > screenHeight) return;
+        if (a.position.x < 0 && b.position.x < 0 && c.position.x < 0) { JET_EMIT_REJ(JP_REJ_SCREEN) return; }
+        if (a.position.x > screenWidth && b.position.x > screenWidth && c.position.x > screenWidth) { JET_EMIT_REJ(JP_REJ_SCREEN) return; }
+        if (a.position.y < 0 && b.position.y < 0 && c.position.y < 0) { JET_EMIT_REJ(JP_REJ_SCREEN) return; }
+        if (a.position.y > screenHeight && b.position.y > screenHeight && c.position.y > screenHeight) { JET_EMIT_REJ(JP_REJ_SCREEN) return; }
 
         // 64-bit shoelace: projected coords from a near-plane-clipped vertex
         // can be tens of thousands of units, which would overflow a 32-bit
@@ -1807,7 +1828,7 @@ void PERF_CRITICAL Scene::renderObject(PrepareLane& L, Object* obj,
             case CullingMode::CULL_FRONTFACES: shouldCull = (shoelaceArea >= 0); break;
             case CullingMode::NO_CULLING: break;
         }
-        if (shouldCull) return;
+        if (shouldCull) { JET_EMIT_REJ(JP_REJ_BACKFACE) return; }
 #if JET_CULL_SLIVERS
         // Hairline triangles: a face seen almost edge-on projects to a long
         // sliver a fraction of a pixel thick; point sampling paints it at full

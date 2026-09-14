@@ -37,6 +37,14 @@ namespace Renderer
     bool Object::cachePositions() {
         static_assert(std::is_trivially_destructible<Vector3>::value,
                       "Position cache allocation requires trivial destruction");
+        // REFRESH in place when the stream is already the right size and nobody else shares it. A mesh whose
+        // vertices are rewritten every few frames (terrain geomorph moves position.y) would otherwise pay a
+        // malloc and a free per refresh, which is most of what the cache is meant to save.
+        if (positionCacheSize == vertices.size() && positionCache && positionCache.use_count() == 1) {
+            Vector3* p = const_cast<Vector3*>(positionCache.get());
+            for (size_t i = 0; i < vertices.size(); ++i) p[i] = vertices[i].position;
+            return true;
+        }
         invalidatePositions();
         if (vertices.empty()) return true;
         if (vertices.size() > SIZE_MAX / sizeof(Vector3)) return false;
