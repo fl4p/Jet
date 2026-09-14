@@ -15,6 +15,25 @@ namespace Renderer
     {
     }
 
+    // Allocate (or reuse) the packed brightness stream. The caller fills it and
+    // sets brightnessCacheKey; an empty mesh or a failed allocation returns
+    // nullptr and leaves the ordinary per-vertex path active.
+    uint16_t* Object::brightnessCacheData(size_t n) {
+        if (n == 0) return nullptr;
+        if (brightnessCacheSize == n && brightnessCache) return brightnessCache.get();
+        brightnessCache.reset(); brightnessCacheSize = 0; brightnessCacheKey = 0;
+        if (n > SIZE_MAX / sizeof(uint16_t)) return nullptr;
+#if defined(ESP_PLATFORM) && defined(CONFIG_SPIRAM)
+        void* storage = heap_caps_malloc(n * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#else
+        void* storage = std::malloc(n * sizeof(uint16_t));
+#endif
+        if (!storage) return nullptr;
+        brightnessCache = std::shared_ptr<uint16_t>(static_cast<uint16_t*>(storage), [](uint16_t* p) { std::free(p); });
+        brightnessCacheSize = n;
+        return brightnessCache.get();
+    }
+
     bool Object::cachePositions() {
         static_assert(std::is_trivially_destructible<Vector3>::value,
                       "Position cache allocation requires trivial destruction");

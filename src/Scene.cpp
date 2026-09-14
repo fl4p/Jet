@@ -14,6 +14,9 @@
 #define JET_CULL_SLIVERS 1   // drop triangles thinner than half a pixel at emit time (see emitTri)
 #endif
 #if JET_CULL_SLIVERS
+#ifndef JET_PACKED_BRIGHTNESS
+#define JET_PACKED_BRIGHTNESS 0   // 1: cache the object-local Lambert brightness in a stream parallel to the
+#endif                            //    packed positions, so prepare never touches the fat Object::Vertex
 namespace Renderer {
 float   jetSliverMinThickness = 0.05f;   // pixels: thinner than this is dropped (degenerate / sign-flipped back faces)
 float   jetSliverPushMaxThickness = 0.5f; // pixels: thinner than this is sorted behind its neighbours (see emitTri)
@@ -1526,6 +1529,31 @@ void PERF_CRITICAL Scene::renderObject(PrepareLane& L, Object* obj,
 
     // Transform vertices and normals, writing only live projected attributes.
     const Vector3* packedPositions = meshSource->cachedPositions();
+#if JET_PACKED_BRIGHTNESS
+    // Object-local light: the per-vertex Lambert brightness depends only on the MESH-LOCAL normal and the
+    // object-space light, so it is constant until the light moves -- yet it was recomputed every frame, and
+    // the recompute is not the cost: reaching `srcVert.normal` drags the whole 36-40 byte Object::Vertex
+    // through the cache for a 12-byte field. With a packed stream the loop streams 12 bytes of position and
+    // 2 of brightness instead. The key is what keeps it honest: any change to the light that feeds the
+    // values changes it, and a mismatch refills the stream.
+    const uint16_t* packedBright = nullptr;
+    if (packedPositions && objectLocalLight && !isBillboard && !objHasRotation && obj->lightHint != 2) {
+        uint32_t key = 2166136261u;
+        for (int32_t v : {objLightDir.x, objLightDir.y, objLightDir.z, (int32_t)objLightIntensity, (int32_t)objDiffuseCoef})
+            key = (key ^ (uint32_t)v) * 16777619u;
+        key |= 1u;                                   // 0 means "empty"
+        Object* mutableMesh = const_cast<Object*>(meshSource);
+        if (mutableMesh->brightnessCacheKey == key) {
+            packedBright = mutableMesh->cachedBrightness();
+        } else if (uint16_t* w = mutableMesh->brightnessCacheData(vertCount)) {
+            for (size_t vi = 0; vi < vertCount; ++vi)
+                w[vi] = (uint16_t)sceneLambertDiffuse(Vector3(meshSource->vertices[vi].normal),
+                                                      objLightDir, objLightIntensity, objDiffuseCoef);
+            mutableMesh->brightnessCacheKey = key;
+            packedBright = w;
+        }
+    }
+#endif
 #if JET_PROFILE
     L.prof_cnt[JP_XFORM] += (uint32_t)vertCount;
     const uint32_t jpv0 = jet_prof_now();
@@ -1536,6 +1564,25 @@ void PERF_CRITICAL Scene::renderObject(PrepareLane& L, Object* obj,
         PipelineVertex& dst = transformedVertices[vi];
         const Vector3 pos = cameraPosition(packedPositions ? packedPositions[vi] : srcVert.position);
 #if LIGHTING
+#if JET_PACKED_BRIGHTNESS
+        if (packedBright) {   // streams only: no Object::Vertex read, no normal transform, no shading call.
+                              // Safe because objectLocalLight implies brightnessPrecomputed, and the
+                              // rasterizer then never looks at dst.normal (Renderer.cpp drawTriangle).
+            float invZp;
+#if defined(__XTENSA__) && defined(ESP_PLATFORM)
+            { const float fz = (float)pos.z; float r;
+              __asm__("recip0.s %0, %1" : "=f"(r) : "f"(fz));
+              r = r * (2.0f - fz * r); r = r * (2.0f - fz * r); invZp = fovFactor * r; }
+#else
+            invZp = fovFactor / (float)pos.z;
+#endif
+            dst.position.x = (int32_t)(pos.x * invZp) + screenWidth / 2;
+            dst.position.y = screenHeight / 2 - (int32_t)(pos.y * invZp);
+            dst.position.z = pos.z;
+            dst.lambertBrightness = packedBright[vi];
+            continue;
+        }
+#endif
         Vector3 normal(srcVert.normal);
         // Normals use the combined ROTATION only — no translation. The
         // object-local-light path skips the transform entirely and shades

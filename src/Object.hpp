@@ -77,6 +77,20 @@ public:
     }
     void invalidatePositions() { positionCache.reset(); positionCacheSize = 0; }
 
+    /// Packed per-vertex Lambert brightness, parallel to cachedPositions().
+    /// The point is TRAFFIC, not arithmetic: the prepare loop otherwise touches
+    /// the whole 36-40 byte Object::Vertex to reach one 12-byte position and one
+    /// 12-byte normal, and on an ESP32-S3 that read is most of the 536 cycles a
+    /// vertex costs. With both caches live the loop streams 12 + 2 bytes.
+    /// The Scene fills it and owns `brightnessCacheKey`: any change in the light
+    /// that feeds the values must change the key, or the cache goes stale.
+    uint16_t* brightnessCacheData(size_t n);
+    const uint16_t* cachedBrightness() const {
+        return brightnessCacheSize == vertices.size() ? brightnessCache.get() : nullptr;
+    }
+    void invalidateBrightness() { brightnessCache.reset(); brightnessCacheSize = 0; brightnessCacheKey = 0; }
+    uint32_t brightnessCacheKey = 0;   ///< 0 = empty; the Scene's light fingerprint otherwise.
+
     Vector3 boundingBoxMin = {0,0,0};   ///< Local-space AABB minimum (recomputed by calculateBoundingBox).
     Vector3 boundingBoxMax = {0,0,0};   ///< Local-space AABB maximum.
     Vector3 centreVolume = {0,0,0};     ///< Local-space AABB centre.
@@ -308,6 +322,8 @@ public:
 private:
     std::shared_ptr<const Vector3> positionCache;
     size_t positionCacheSize = 0;
+    std::shared_ptr<uint16_t> brightnessCache;   // parallel to positionCache; written by the Scene, see brightnessCacheKey
+    size_t brightnessCacheSize = 0;
 
 };
 
