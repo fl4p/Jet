@@ -419,6 +419,10 @@ jetFlatOpaqueKernel(uint16_t* fb, int32_t stride,
     const uint32_t wcol32 = ((uint32_t)wcol << 16) | wcol;
     uint16_t* row = fb + (int32_t)y * stride;
     const int32_t rows = maxY - y + 1;
+#if JET_PROFILE
+    ++jet_prof_cnt[JP_K_TRI];                    // counted INSIDE the kernel: the outer JP_TRI_* counters sit in
+    jet_prof_cnt[JP_K_ROWS] += (uint32_t)rows;   // one dispatch branch only and miss the direct one entirely
+#endif
     for (; y <= maxY; ++y, row += stride)
     {
         if (y >= switchY) {
@@ -434,6 +438,9 @@ jetFlatOpaqueKernel(uint16_t* fb, int32_t stride,
         {
             uint16_t* d = row + l;
             int32_t n = r - l + 1;
+#if JET_PROFILE
+            jet_prof_cnt[JP_TRI_PIX] += (uint32_t)n;
+#endif
             if ((uintptr_t)d & 2) { *d++ = wcol; --n; }
             uint32_t* d32 = reinterpret_cast<uint32_t*>(d);
             for (int32_t k = n >> 1; k > 0; --k) *d32++ = wcol32;
