@@ -57,20 +57,31 @@ static void initBakedMat() {
 // Inlining the specular branch here would mean its `N.z < 0` test
 // would be reading an object-local component instead of view-space Z
 // and give wrong results.
-static inline uint16_t sceneLambertDiffuse(const Vector3& N, const Vector3& L,
-                                           uint16_t lightIntensity,
-                                           uint8_t diffuseCoef)
+// Split in two so a cache can hold the half that depends only on the GEOMETRY. The base is a pure
+// function of the normal and the light DIRECTION; intensity and the diffuse coefficient scale it
+// afterwards. Same operations in the same order as the single function it replaces, so caching the
+// base and applying the scale later is bit-exact, not merely close.
+static inline uint32_t sceneLambertBase(const Vector3& N, const Vector3& L)
 {
-    if (lightIntensity > 255) lightIntensity = 255;
     int64_t lit = Vector3::dotProduct(N, L);
     if (lit <= 0) return 0;
     uint32_t lambert = (uint32_t)(lit >> 12);
     if (lambert > 255) lambert = 255;
-    lambert = (lambert * lambert + 128) >> 8;       // squared falloff
+    return (lambert * lambert + 128) >> 8;          // squared falloff
+}
+static inline uint16_t sceneLambertApply(uint32_t lambert, uint16_t lightIntensity, uint8_t diffuseCoef)
+{
+    if (lightIntensity > 255) lightIntensity = 255;
     lambert = (lambert * lightIntensity) >> 8;
     uint32_t diffuseTerm = (lambert * diffuseCoef) >> 8;
     if (diffuseTerm > 255) diffuseTerm = 255;
     return (uint16_t)diffuseTerm;
+}
+static inline uint16_t sceneLambertDiffuse(const Vector3& N, const Vector3& L,
+                                           uint16_t lightIntensity,
+                                           uint8_t diffuseCoef)
+{
+    return sceneLambertApply(sceneLambertBase(N, L), lightIntensity, diffuseCoef);
 }
 #endif
 
@@ -1538,8 +1549,13 @@ void PERF_CRITICAL Scene::renderObject(PrepareLane& L, Object* obj,
     // values changes it, and a mismatch refills the stream.
     const uint16_t* packedBright = nullptr;
     if (packedPositions && objectLocalLight && !isBillboard && !objHasRotation && obj->lightHint != 2) {
+        // Key on the light DIRECTION only. The first version keyed on intensity and the diffuse
+        // coefficient too, and the device answered +100 us a frame at both x1 and x4: the time of day
+        // moves the intensity every step (235 - 85 * low), so the stream refilled continuously and the
+        // cache was pure overhead. The base value does not depend on either, so they belong in the
+        // per-vertex scale, not in the key.
         uint32_t key = 2166136261u;
-        for (int32_t v : {objLightDir.x, objLightDir.y, objLightDir.z, (int32_t)objLightIntensity, (int32_t)objDiffuseCoef})
+        for (int32_t v : {objLightDir.x, objLightDir.y, objLightDir.z})
             key = (key ^ (uint32_t)v) * 16777619u;
         key |= 1u;                                   // 0 means "empty"
         Object* mutableMesh = const_cast<Object*>(meshSource);
@@ -1547,8 +1563,7 @@ void PERF_CRITICAL Scene::renderObject(PrepareLane& L, Object* obj,
             packedBright = mutableMesh->cachedBrightness();
         } else if (uint16_t* w = mutableMesh->brightnessCacheData(vertCount)) {
             for (size_t vi = 0; vi < vertCount; ++vi)
-                w[vi] = (uint16_t)sceneLambertDiffuse(Vector3(meshSource->vertices[vi].normal),
-                                                      objLightDir, objLightIntensity, objDiffuseCoef);
+                w[vi] = (uint16_t)sceneLambertBase(Vector3(meshSource->vertices[vi].normal), objLightDir);
             mutableMesh->brightnessCacheKey = key;
             packedBright = w;
         }
@@ -1579,7 +1594,7 @@ void PERF_CRITICAL Scene::renderObject(PrepareLane& L, Object* obj,
             dst.position.x = (int32_t)(pos.x * invZp) + screenWidth / 2;
             dst.position.y = screenHeight / 2 - (int32_t)(pos.y * invZp);
             dst.position.z = pos.z;
-            dst.lambertBrightness = packedBright[vi];
+            dst.lambertBrightness = sceneLambertApply(packedBright[vi], objLightIntensity, objDiffuseCoef);
             continue;
         }
 #endif
