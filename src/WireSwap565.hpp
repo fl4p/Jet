@@ -1,3 +1,4 @@
+#pragma once
 // JET_WIRE_SWAP: the framebuffer holds byte-swapped (wire-order) RGB565 so the
 // panel DMA push needs zero conversion passes (saves a full read+write of the
 // frame per frame; PSRAM bandwidth is the bottleneck on ESP32-S3). All
