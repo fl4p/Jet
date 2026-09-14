@@ -40,6 +40,11 @@ namespace Renderer
         // REFRESH in place when the stream is already the right size and nobody else shares it. A mesh whose
         // vertices are rewritten every few frames (terrain geomorph moves position.y) would otherwise pay a
         // malloc and a free per refresh, which is most of what the cache is meant to save.
+        // Geometry changed, so any brightness cached from the NORMALS is stale too. The scene calls this
+        // exactly where it rewrites vertices (generation, and the geomorph, which recomputes normals right
+        // after it moves position.y), so tying the two here is what keeps them consistent: a host invariant
+        // -- "render between steps must not change the result" -- caught the version that did not.
+        invalidateBrightness();
         if (positionCacheSize == vertices.size() && positionCache && positionCache.use_count() == 1) {
             Vector3* p = const_cast<Vector3*>(positionCache.get());
             for (size_t i = 0; i < vertices.size(); ++i) p[i] = vertices[i].position;
