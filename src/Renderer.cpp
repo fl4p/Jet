@@ -346,6 +346,10 @@ namespace Renderer
     }
 
 
+#ifndef JET_FLAT_KERNEL_FAST
+#define JET_FLAT_KERNEL_FAST 0   // 1: hoist the switch-row test and the span clamps out of the row loop (identical pixels)
+#endif
+
 #if JET_FLAT_KERNEL
 namespace {
 // Exact rational edge stepper (same arithmetic as Detail::ScanEdge, inc = 1):
@@ -423,6 +427,55 @@ jetFlatOpaqueKernel(uint16_t* fb, int32_t stride,
     ++jet_prof_cnt[JP_K_TRI];                    // counted INSIDE the kernel: the outer JP_TRI_* counters sit in
     jet_prof_cnt[JP_K_ROWS] += (uint32_t)rows;   // one dispatch branch only and miss the direct one entirely
 #endif
+#if JET_FLAT_KERNEL_FAST
+    // Two pieces of per-row bookkeeping are loop-invariant and were being paid on every row. The valley's spans
+    // are ~7 pixels over ~12 rows (esp32-perf tools/rastcount), so per-row work, not the fill, is the cost.
+    //   - the switch-row test: the second edge changes at most ONCE, so the walk splits into two runs
+    //   - the clamps: when every vertex x is inside [minX, maxX] so is every span, because the stepper's x stays
+    //     between the edge endpoints. Then `l` and `r` need no clamping at all.
+    // Both are pure control flow: the pixels written are identical row for row (tools/rasterdiff.cpp checks it
+    // against the original walk over a million random triangles).
+    const int32_t txlo = ax < bx ? (ax < cx ? ax : cx) : (bx < cx ? bx : cx);
+    const int32_t txhi = ax > bx ? (ax > cx ? ax : cx) : (bx > cx ? bx : cx);
+    const bool interior = txlo >= minX && txhi <= maxX;
+    #define JET_FLAT_ROWS(Y_END, CLAMP)                                                       \
+        for (; y <= (Y_END); ++y, row += stride) {                                            \
+            int32_t l = left.x + (left.rem != 0);                                             \
+            int32_t r = right.x;                                                              \
+            if (CLAMP) { if (l < minX) l = minX; if (r > maxX) r = maxX; }                     \
+            if (l <= r) {                                                                     \
+                uint16_t* d = row + l;                                                        \
+                int32_t n = r - l + 1;                                                        \
+                JET_FLAT_PIXCOUNT(n)                                                          \
+                if ((uintptr_t)d & 2) { *d++ = wcol; --n; }                                   \
+                uint32_t* d32 = reinterpret_cast<uint32_t*>(d);                               \
+                for (int32_t k = n >> 1; k > 0; --k) *d32++ = wcol32;                         \
+                if (n & 1) *reinterpret_cast<uint16_t*>(d32) = wcol;                          \
+            }                                                                                 \
+            uint32_t sum = left.rem + left.srem;                                              \
+            bool carry = sum >= left.div;                                                     \
+            left.x += left.step + carry;                                                      \
+            left.rem = sum - (carry ? left.div : 0);                                          \
+            sum = right.rem + right.srem;                                                     \
+            carry = sum >= right.div;                                                         \
+            right.x += right.step + carry;                                                    \
+            right.rem = sum - (carry ? right.div : 0);                                        \
+        }
+#if JET_PROFILE
+    #define JET_FLAT_PIXCOUNT(n) jet_prof_cnt[JP_TRI_PIX] += (uint32_t)(n);
+#else
+    #define JET_FLAT_PIXCOUNT(n)
+#endif
+    const int32_t firstEnd = switchY - 1 < maxY ? switchY - 1 : maxY;
+    if (interior) { JET_FLAT_ROWS(firstEnd, false) } else { JET_FLAT_ROWS(firstEnd, true) }
+    if (y <= maxY) {                       // the short edge changes here, once
+        FlatEdge e; flatEdgeReset(e, bx, by, cx, cy, y);
+        if (shortLeft) left = e; else right = e;
+        if (interior) { JET_FLAT_ROWS(maxY, false) } else { JET_FLAT_ROWS(maxY, true) }
+    }
+    #undef JET_FLAT_ROWS
+    #undef JET_FLAT_PIXCOUNT
+#else
     for (; y <= maxY; ++y, row += stride)
     {
         if (y >= switchY) {
@@ -457,8 +510,18 @@ jetFlatOpaqueKernel(uint16_t* fb, int32_t stride,
             right.rem = sum - (carry ? right.div : 0);
         }
     }
+#endif
     return rows;
 }
+    // Bench entry (esp32-perf tools/rasterbench.cpp): the kernel with no Rasterizer state, so a change to
+    // the per-row bookkeeping can be timed against the valley's real span geometry before it goes near a board.
+    int jetFlatOpaqueKernelBench(uint16_t* fb, int32_t stride,
+                                 int32_t x1, int32_t y1, int32_t x2, int32_t y2, int32_t x3, int32_t y3,
+                                 int32_t minX, int32_t maxX, int32_t firstRow, int32_t maxY, uint16_t wcol)
+    {
+        return jetFlatOpaqueKernel(fb, stride, x1, y1, x2, y2, x3, y3, minX, maxX, firstRow, maxY, wcol);
+    }
+
     // Public entry for Scene::rasterizeBand's direct dispatch (flat-opaque
     // triangles whose colour was fixed at emit time). Clamps are the caller's.
     int PERF_CRITICAL Rasterizer::drawFlatOpaque(int32_t x1, int32_t y1, int32_t x2, int32_t y2, int32_t x3, int32_t y3,
